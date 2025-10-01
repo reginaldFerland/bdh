@@ -3,6 +3,8 @@
 ## Baby Dragon Hatchling
 This repository contains source code from the paper: Adrian Kosowski, Przemysław Uznański, Jan Chorowski, Zuzanna Stamirowska, Michał Bartoszkiewicz, _"The Dragon Hatchling: The Missing Link between the Transformer and Models of the Brain"_, [link](https://doi.org/10.48550/arXiv.2509.26507).
 
+<img src="figs/architecture.png" height="150"/> <img src="figs/vocab.png" height="150"/> <img src="figs/bdh_scaling.png" height="150"/> 
+
 ## Abstract:
 The relationship between computing systems and the brain has served as motivation for pioneering theoreticians since John von Neumann and Alan Turing. 
 Uniform, scale-free biological networks, such as the brain, have powerful properties, including generalizing over time, which is the main barrier for Machine Learning on the path to Universal Reasoning Models.
