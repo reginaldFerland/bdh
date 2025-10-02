@@ -31,3 +31,12 @@ BDH can be represented as a brain model. It contains $n$ neurons, organized as a
 BDH is designed for interpretability. Activation vectors of BDH are sparse and positive. We demonstrate monosemanticity in BDH on language tasks, including representation of concept abstractions, which happens even for small models, below 100M-parameter scale. Interpretability of state, which goes beyond interpretability of neurons and model parameters, is an inherent feature of the BDH architecture. 
 
 We believe BDH opens the door to a new theory of _Thermodynamic Limit_ behavior for language and reasoning models, with the ultimate goal of Probably Approximately Correct (PAC)-like bounds for generalization of reasoning over time.
+
+## Running the code
+
+To train and sample from the BDH model on a toy language modeling task please do:
+1. `pip install -r requirements.txt`
+2. `python train.py`
+
+## Acknowledgements
+We thank Andrej Karpathy for the [nanoGPT](https://github.com/karpathy/nanoGPT/) code and the tiny Shapespeare dataset used in this demonstration.
