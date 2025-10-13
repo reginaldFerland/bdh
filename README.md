@@ -38,3 +38,11 @@ To train and sample from the BDH model on a toy language modeling task please do
 
 ## Acknowledgements
 We thank Andrej Karpathy for the [nanoGPT](https://github.com/karpathy/nanoGPT/) code and the tiny Shapespeare dataset used in this demonstration.
+
+## Community forks
+* Fork by [rkinas](https://github.com/rkinas/bdh)
+* Fork by [adamskrodzki](https://github.com/adamskrodzki/bdh): dynamic vocabulary, stateful attention, and QoL
+* Fork by [mosure](https://github.com/mosure/burn_dragon_hatchling): burn port
+* Fork by [severian42](https://github.com/severian42/bdh): MLX port
+* Fork by [Faisal](https://github.com/Git-Faisal/bdh)
+* Fork by [GrahLnn](https://github.com/GrahLnn/bdh)
