@@ -2,7 +2,7 @@
 
 ## **Bridging the Gap Between Transformers and the Brain**
 
-**Baby Dragon Hatchling (BDH)** is a biologically inspired large language model architecture that connects principles of deep learning with the foundations of neuroscience. Developed by researchers at [Pathway](https://pathway.com), BDH provides a theoretical and practical framework for understanding how reasoning and generalization might emerge in artificial systems.
+**Baby Dragon Hatchling (BDH)** is a biologically inspired large language model architecture that connects principles of deep learning with the foundations of neuroscience. Developed by researchers at [Pathway](https://pathway.com), BDH provides a theoretical and practical framework for understanding the emergence of reasoning and generalization in artificial systems.
 
 This repository contains the official implementation from the paper:
 > *A. Kosowski, P. Uznański, J. Chorowski, Z. Stamirowska, M. Bartoszkiewicz.*
@@ -21,7 +21,7 @@ BDH represents a **scale-free, locally interacting network of neurons** capable 
 - **GPU-friendly state-space formulation** for efficient implementation
 - **Interpretable activations** that are sparse and positive
 
-BDH formalizes a bridge between **neural computation and machine-based language understanding**. It shows how **macro reasoning behavior** in large AI models may emerge from **micro-level neuron dynamics**, guided by principles of graph theory and local computation.
+BDH formalizes a bridge between **neural computation and machine-based language understanding**. It shows how **macro reasoning behavior** in large AI models emerges from **micro-level neuron dynamics**, guided by principles of graph theory and local computation.
 
 Empirically, BDH matches **GPT-2–scale Transformers** across language and translation tasks at equivalent parameter scales (10M–1B).
 
