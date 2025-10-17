@@ -58,7 +58,15 @@ pip install -r requirements.txt
 
 # train BDH on a toy dataset
 python train.py
+
+# run tests
+./run_tests.sh
+# or individually
+python tests/test_data_fixes.py
+python tests/test_new_features.py
 ```
+
+See the `tests/` directory for test documentation and the `examples/` directory for advanced training scripts.
 
 <!--For visualization and interpretability analysis, explore the example notebooks in `notebooks/`.-->
 

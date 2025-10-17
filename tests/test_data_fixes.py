@@ -1,6 +1,12 @@
 #!/usr/bin/env python
 """Quick test to verify the data.py fixes work correctly."""
 
+import sys
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import torch
 import numpy as np
 from data import DatasetLoader, DatasetLoaderConfig

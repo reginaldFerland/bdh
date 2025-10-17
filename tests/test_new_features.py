@@ -1,8 +1,13 @@
 #!/usr/bin/env python
 """Test the new features added to data.py."""
 
-import torch
+import sys
 from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import torch
 from data import DatasetLoader, DatasetLoaderConfig
 
 
