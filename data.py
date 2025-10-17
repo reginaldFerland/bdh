@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, List, Optional, Protocol, Tuple
 
 import numpy as np
 import requests
@@ -12,12 +12,22 @@ import torch
 
 from tokenizer_utils import TokenizerManager
 
+if TYPE_CHECKING:
+    from datasets import Dataset, DatasetDict
+
+
+class IterableDataset(Protocol):
+    """Protocol for iterable dataset objects from HuggingFace datasets library."""
+    
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        """Iterate over dataset records."""
+        ...
+
+
 try:
-    from datasets import Dataset, DatasetDict, load_dataset  # type: ignore
+    from datasets import load_dataset  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     load_dataset = None  # type: ignore
-    Dataset = None  # type: ignore
-    DatasetDict = None  # type: ignore
 
 
 _DEFAULT_SHAKESPEARE_URL = (
@@ -39,18 +49,21 @@ class DatasetLoaderConfig:
     device: Optional[torch.device] = None
     cache_dir: Optional[Path] = None
     seed: int = 42
-    show_progress: bool = True
 
 
 class DatasetLoader:
     """Dataset loader supporting HuggingFace datasets and local files."""
 
+    # Configuration constants
+    MAX_CONSECUTIVE_EMPTY_RECORDS = 100
+    MAX_TOTAL_STREAM_ATTEMPTS = 1000
+    STREAM_BUFFER_SIZE_MULTIPLIER = 100
+    DEFAULT_PRIORITY_COLUMNS = ("text", "content", "article", "body")
+
     def __init__(self, config: DatasetLoaderConfig):
         self.config = config
         self.data_dir = config.data_dir or Path(__file__).resolve().parent
-        self.device = config.device
-        if self.device and not isinstance(self.device, torch.device):
-            self.device = torch.device(self.device)
+        self.device = self._normalize_device(config.device)
         self.block_size = config.block_size
         self.train_split = max(0.0, min(config.train_split, 1.0))
         self.dataset_name = config.dataset_name.lower()
@@ -63,10 +76,13 @@ class DatasetLoader:
         self._val_array: Optional[np.ndarray] = None
         self._stream_iters: Dict[str, Iterator] = {}
         self._stream_buffers: Dict[str, List[int]] = {"train": [], "val": []}
-        self._stream_builders: Dict[str, Callable[[], Iterable]] = {}
+        self._stream_builders: Dict[str, Callable[[], IterableDataset]] = {}
 
         self._separator_tokens = self._compute_separator_tokens()
         self._rng = np.random.default_rng(config.seed)
+        
+        # Validate configuration
+        self._validate_config()
 
     # ------------------------------------------------------------------ Public API
     def load_dataset(self) -> None:
@@ -95,8 +111,15 @@ class DatasetLoader:
             raise ValueError(f"Unsupported split '{split}'. Expected 'train' or 'val'.")
 
         if self.streaming:
-            return self._streaming_batch(split, batch_size)
-        return self._in_memory_batch(split, batch_size)
+            batch = self._streaming_batch(split, batch_size)
+        else:
+            batch = self._in_memory_batch(split, batch_size)
+        
+        # Track batch generation for context manager statistics
+        if hasattr(self, '_batches_generated'):
+            self._batches_generated += 1
+        
+        return batch
 
     def __iter__(self):
         """Make the loader iterable for Pythonic usage.
@@ -115,6 +138,43 @@ class DatasetLoader:
         """
         batch_size = getattr(self.config, 'batch_size', 8)
         return self.get_batch(self._iter_split, batch_size)
+
+    def __enter__(self):
+        """Context manager entry - returns self for use in 'with' statements."""
+        # Initialize tracking for context manager usage
+        self._batches_generated = 0
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit with proper resource cleanup and error handling.
+        
+        Args:
+            exc_type: Exception type if an exception occurred
+            exc_val: Exception value if an exception occurred  
+            exc_tb: Exception traceback if an exception occurred
+            
+        Returns:
+            False to not suppress exceptions
+        """
+        try:
+            # Clear streaming resources to free memory
+            self._stream_iters.clear()
+            self._stream_buffers.clear()
+            
+            # Log statistics on successful completion
+            if exc_type is None and hasattr(self, '_batches_generated'):
+                if self._batches_generated > 0:
+                    total_tokens = self._batches_generated * self.config.batch_size * self.block_size
+                    print(f"Dataset loader closed. Generated {self._batches_generated} batches "
+                          f"({total_tokens:,} tokens processed).")
+        except Exception as cleanup_error:
+            # Don't suppress the original exception if one exists
+            if exc_type is None:
+                raise cleanup_error
+            # Otherwise, just log the cleanup error and continue with original exception
+            print(f"Warning: Error during cleanup: {cleanup_error}")
+        
+        return False  # Don't suppress exceptions
 
     # ---------------------------------------------------------------- Shakespeare
     def _load_shakespeare(self) -> None:
@@ -144,7 +204,7 @@ class DatasetLoader:
 
     # ------------------------------------------------------------- HuggingFace IO
     def _load_hf_in_memory(self) -> None:
-        dataset_dict: DatasetDict = load_dataset(
+        dataset_dict: "DatasetDict" = load_dataset(
             self.dataset_name,
             self.dataset_config,
             streaming=False,
@@ -152,17 +212,13 @@ class DatasetLoader:
         )
         train_dataset, val_dataset = self._resolve_splits(dataset_dict)
         
-        # Shuffle training dataset for better training dynamics
-        if hasattr(train_dataset, 'shuffle'):
-            train_dataset = train_dataset.shuffle(seed=self.config.seed)
-        
         self._train_array = self._dataset_to_array(train_dataset)
         self._val_array = (
             self._dataset_to_array(val_dataset) if val_dataset is not None else None
         )
 
     def _load_hf_streaming(self) -> None:
-        dataset_dict: DatasetDict = load_dataset(
+        dataset_dict: "DatasetDict" = load_dataset(
             self.dataset_name,
             self.dataset_config,
             streaming=True,
@@ -240,20 +296,66 @@ class DatasetLoader:
     def _next_stream_sample(
         self,
         split: str,
-        builder: Callable[[], Iterable],
+        builder: Callable[[], IterableDataset],
         buffer: List[int],
         required: int,
     ) -> List[int]:
+        """Extract next sample from streaming dataset buffer.
+        
+        Fills the buffer from the streaming iterator until it has enough tokens,
+        then extracts and returns the required number of tokens.
+        
+        Args:
+            split: Dataset split name ('train' or 'val')
+            builder: Factory function to create new iterator
+            buffer: Token buffer to use
+            required: Number of tokens needed
+            
+        Returns:
+            List of token IDs for the sample
+        """
         iterator = self._stream_iters.get(split)
         if iterator is None:
             iterator = iter(builder())
             self._stream_iters[split] = iterator
 
+        self._fill_buffer_from_stream(split, iterator, builder, buffer, required)
+        
+        sample = buffer[:required]
+        del buffer[:required]
+        return sample
+    
+    def _fill_buffer_from_stream(
+        self,
+        split: str,
+        iterator: Iterator[Dict[str, Any]],
+        builder: Callable[[], IterableDataset],
+        buffer: List[int],
+        required: int,
+    ) -> None:
+        """Fill buffer from streaming iterator until it has required tokens.
+        
+        Args:
+            split: Dataset split name ('train' or 'val')
+            iterator: Current iterator over dataset records
+            builder: Factory function to create new iterator on exhaustion
+            buffer: Token buffer to fill
+            required: Minimum number of tokens needed in buffer
+        """
         consecutive_empty = 0
-        max_consecutive_empty = 100  # Prevent infinite loops on consecutive bad data
-        max_buffer_size = self.block_size * 100  # Prevent OOM from huge documents
+        total_attempts = 0
 
         while len(buffer) < required:
+            # Absolute limit to prevent infinite loops on empty/corrupted datasets
+            total_attempts += 1
+            if total_attempts > self.MAX_TOTAL_STREAM_ATTEMPTS:
+                raise RuntimeError(
+                    f"Failed to fill buffer after {self.MAX_TOTAL_STREAM_ATTEMPTS} attempts "
+                    f"for split '{split}'. Dataset may be empty, corrupted, or all records "
+                    "are invalid. Check your dataset configuration and text_column setting."
+                )
+
+            # Get next record, restart iterator if exhausted
             try:
                 record = next(iterator)
             except StopIteration:
@@ -262,31 +364,32 @@ class DatasetLoader:
                 consecutive_empty = 0  # Reset counter on iterator restart
                 continue
 
+            # Extract and validate text from record
             text = self._extract_text(record)
             if not text:
                 consecutive_empty += 1
-                if consecutive_empty >= max_consecutive_empty:
+                if consecutive_empty >= self.MAX_CONSECUTIVE_EMPTY_RECORDS:
                     raise ValueError(
-                        f"Found {max_consecutive_empty} consecutive empty records in "
-                        f"streaming dataset split '{split}'. Data may be corrupted."
+                        f"Found {self.MAX_CONSECUTIVE_EMPTY_RECORDS} consecutive empty records in "
+                        f"streaming dataset split '{split}'. Data may be corrupted or the "
+                        f"text_column setting ('{self.text_column}') may be incorrect."
                     )
                 continue
             
-            consecutive_empty = 0  # Reset on valid record
+            # Successfully got valid text, reset empty counter
+            consecutive_empty = 0
+            
+            # Encode and add to buffer
             encoded = self._encode_text(text)
-            if not encoded:
-                continue
-            buffer.extend(encoded)
-            if self._separator_tokens:
-                buffer.extend(self._separator_tokens)
+            if encoded:
+                buffer.extend(encoded)
+                if self._separator_tokens:
+                    buffer.extend(self._separator_tokens)
             
             # Prevent buffer from growing too large (OOM protection)
+            max_buffer_size = self.block_size * self.STREAM_BUFFER_SIZE_MULTIPLIER
             if len(buffer) > max_buffer_size:
                 break
-
-        sample = buffer[:required]
-        del buffer[:required]
-        return sample
 
     # --------------------------------------------------------------- Util helpers
     def has_split(self, split: str) -> bool:
@@ -297,6 +400,55 @@ class DatasetLoader:
             has_array = self._val_array is not None and len(self._val_array) > self.block_size
             return has_array or ("val" in self._stream_builders)
         raise ValueError(f"Unknown split '{split}'. Expected 'train' or 'val'.")
+
+    def _normalize_device(self, device: Optional[torch.device]) -> Optional[torch.device]:
+        """Normalize device to torch.device or None.
+        
+        Args:
+            device: Device specification (torch.device, string, or None)
+            
+        Returns:
+            Normalized torch.device or None
+        """
+        if device is None:
+            return None
+        return device if isinstance(device, torch.device) else torch.device(device)
+
+    def _validate_config(self) -> None:
+        """Validate configuration parameters at initialization.
+        
+        Raises:
+            ValueError: If any configuration parameter is invalid.
+        """
+        if self.block_size < 1:
+            raise ValueError(
+                f"block_size must be at least 1, got {self.block_size}. "
+                "Consider using a standard value like 512 or 1024."
+            )
+        
+        if self.config.batch_size < 1:
+            raise ValueError(
+                f"batch_size must be at least 1, got {self.config.batch_size}. "
+                "Typical values are 8, 16, 32, or 64."
+            )
+        
+        if not (0.0 <= self.config.train_split <= 1.0):
+            raise ValueError(
+                f"train_split must be between 0.0 and 1.0, got {self.config.train_split}. "
+                "Use values like 0.9 for 90% train / 10% validation split."
+            )
+        
+        if self.config.seed < 0:
+            raise ValueError(
+                f"seed must be non-negative, got {self.config.seed}. "
+                "Use a positive integer for reproducibility."
+            )
+        
+        if not self.dataset_name:
+            raise ValueError(
+                "dataset_name cannot be empty. "
+                "Use 'shakespeare' for the default dataset or specify a HuggingFace dataset."
+            )
 
     def _validate_loaded_data(self) -> None:
         """Validate that loaded datasets have sufficient tokens for the configured block size."""
@@ -354,8 +506,8 @@ class DatasetLoader:
 
     def _resolve_splits(
         self,
-        dataset_dict: DatasetDict,
-    ) -> Tuple[Dataset, Optional[Dataset]]:
+        dataset_dict: "DatasetDict",
+    ) -> Tuple["Dataset", Optional["Dataset"]]:
         """Resolve train and validation splits from a HuggingFace DatasetDict.
         
         Returns the training dataset and optional validation dataset.
@@ -383,14 +535,14 @@ class DatasetLoader:
         
         return train_ds, val_ds
 
-    def _get_train_dataset(self, dataset_dict: DatasetDict) -> Dataset:
+    def _get_train_dataset(self, dataset_dict: "DatasetDict") -> "Dataset":
         """Extract the training dataset from a DatasetDict."""
         if "train" in dataset_dict:
             return dataset_dict["train"]
         # Fallback to first available split
         return dataset_dict[list(dataset_dict.keys())[0]]
 
-    def _dataset_to_array(self, dataset: Dataset) -> np.ndarray:
+    def _dataset_to_array(self, dataset: "Dataset") -> np.ndarray:
         texts = (self._extract_text(record) for record in dataset)
         return self._corpus_to_array(texts)
 
@@ -403,14 +555,22 @@ class DatasetLoader:
         val_slice = f"{base_split}[{train_pct}%:]"
         return train_slice, val_slice
 
-    def _build_stream_loader(self, dataset_slice: str) -> Callable[[], Iterable]:
+    def _build_stream_loader(self, dataset_slice: str) -> Callable[[], IterableDataset]:
+        """Build a factory function that creates streaming dataset iterators.
+        
+        Args:
+            dataset_slice: Dataset slice specification (e.g., "train[:90%]")
+            
+        Returns:
+            Factory function that returns an iterable dataset
+        """
         if load_dataset is None:  # pragma: no cover - defensive guard
             raise ImportError(
                 "datasets library is required for HuggingFace dataset support. "
                 "Install it with `pip install datasets>=2.14.0`."
             )
 
-        def _loader() -> Iterable:
+        def _loader() -> IterableDataset:
             return load_dataset(
                 self.dataset_name,
                 self.dataset_config,
@@ -421,25 +581,41 @@ class DatasetLoader:
         return _loader
 
     def _extract_text(self, record: Dict) -> str:
-        if self.text_column:
-            value = record.get(self.text_column, "")
+        """Extract text from a dataset record with priority column detection.
+        
+        If text_column is specified, use that. Otherwise, check priority columns
+        first ('text', 'content', 'article', 'body'), then any string value.
+        
+        Args:
+            record: Dataset record dictionary
+            
+        Returns:
+            Extracted text string, or empty string if no valid text found
+        """
+        # Explicit column takes precedence
+        if self.text_column and self.text_column in record:
+            value = record[self.text_column]
             return value if isinstance(value, str) else ""
-
-        for key in ("text", "content", "article", "body"):
-            value = record.get(key)
-            if isinstance(value, str):
-                return value
-
-        for value in record.values():
-            if isinstance(value, str):
-                return value
-        return ""
+        
+        # Try priority columns, then any string value
+        candidates = [
+            *[record.get(col) for col in self.DEFAULT_PRIORITY_COLUMNS],
+            *record.values()
+        ]
+        
+        return next((v for v in candidates if isinstance(v, str) and v), "")
 
     def _corpus_to_array(self, texts: Iterable[str]) -> np.ndarray:
         """Convert an iterable of texts into a single numpy array of token IDs.
         
         Uses numpy concatenation for better memory efficiency compared to 
         accumulating in Python lists.
+        
+        Args:
+            texts: Iterable of text strings to encode
+            
+        Returns:
+            NumPy array of token IDs (dtype=int64)
         """
         chunks: List[np.ndarray] = []
         for text in texts:
@@ -458,11 +634,24 @@ class DatasetLoader:
         return np.concatenate(chunks)
 
     def _encode_text(self, text: str) -> List[int]:
+        """Encode text to token IDs using configured tokenizer.
+        
+        Args:
+            text: Text string to encode
+            
+        Returns:
+            List of token IDs
+        """
         if self.tokenizer is None:
             return list(text.encode("utf-8"))
         return self.tokenizer.encode(text, add_special_tokens=False)
 
     def _compute_separator_tokens(self) -> List[int]:
+        """Compute separator tokens to use between documents.
+        
+        Returns:
+            List of token IDs for newline separator, or [10] for byte-level fallback
+        """
         newline_tokens = self._encode_text("\n")
         if newline_tokens:
             return newline_tokens
