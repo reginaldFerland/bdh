@@ -40,7 +40,7 @@ print(f"Using device: {device} with dtype {dtype}")
 BDH_CONFIG = bdh.BDHConfig()
 BLOCK_SIZE = 512
 BATCH_SIZE = 8
-MAX_ITERS = 3000
+MAX_ITERS = 30000
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0.1
 LOG_FREQ = 100
