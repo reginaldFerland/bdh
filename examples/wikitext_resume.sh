@@ -7,5 +7,5 @@ python train.py \
   --tokenizer-path tokenizers/bpe-32k \
   --batch-size 8 \
   --block-size 512 \
-  --max-iters 30000 \
+  --max-iters 1 \
   --resume
