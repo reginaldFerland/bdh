@@ -234,6 +234,15 @@ class DatasetLoader:
         return sample
 
     # --------------------------------------------------------------- Util helpers
+    def has_split(self, split: str) -> bool:
+        if split == "train":
+            has_array = self._train_array is not None and len(self._train_array) > self.block_size
+            return has_array or (self._train_stream is not None)
+        if split == "val":
+            has_array = self._val_array is not None and len(self._val_array) > self.block_size
+            return has_array or (self._val_stream is not None)
+        raise ValueError(f"Unknown split '{split}'. Expected 'train' or 'val'.")
+
     def _move_to_device(self, x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.device is None:
             return x, y

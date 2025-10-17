@@ -1,12 +1,16 @@
 # Copyright Pathway Technology, Inc.
 
 import argparse
+import dataclasses
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Dict, List, Optional
 
+import numpy as np
 import torch
 
 import bdh
+from checkpoint import CheckpointManager, CheckpointState
 from data import DatasetLoader, DatasetLoaderConfig
 from tokenizer_utils import TokenizerManager
 
@@ -115,6 +119,51 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional directory to persist the trained model and tokenizer.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from the latest checkpoint in --checkpoint_dir.",
+    )
+    parser.add_argument(
+        "--checkpoint_path",
+        "--checkpoint-path",
+        default=None,
+        help="Path to a specific checkpoint file to resume from.",
+    )
+    parser.add_argument(
+        "--checkpoint_dir",
+        "--checkpoint-dir",
+        default="checkpoints",
+        help="Directory for saving training checkpoints.",
+    )
+    parser.add_argument(
+        "--save_freq",
+        "--save-freq",
+        type=int,
+        default=1000,
+        help="Save a checkpoint every N steps.",
+    )
+    parser.add_argument(
+        "--keep_last_n",
+        "--keep-last-n",
+        type=int,
+        default=5,
+        help="Number of recent checkpoints to keep.",
+    )
+    parser.add_argument(
+        "--eval_freq",
+        "--eval-freq",
+        type=int,
+        default=500,
+        help="Run validation every N steps (requires validation split).",
+    )
+    parser.add_argument(
+        "--eval_iters",
+        "--eval-iters",
+        type=int,
+        default=50,
+        help="Number of validation batches per evaluation.",
+    )
     return parser.parse_args()
 
 
@@ -137,20 +186,34 @@ def setup_precision(device: torch.device):
     return dtype, ctx, scaler
 
 
-def init_tokenizer_manager(args: argparse.Namespace) -> TokenizerManager:
-    if args.tokenizer_path:
-        manager = TokenizerManager.from_directory(args.tokenizer_path)
-    else:
-        manager = TokenizerManager(
-            tokenizer_type=args.tokenizer_type,
-            vocab_size=args.tokenizer_vocab_size,
-        )
-        if manager.tokenizer_type != "byte":
-            raise ValueError(
-                "Non-byte tokenizers require --tokenizer_path. "
-                "Train one with train_tokenizer.py before launching training."
-            )
-    return manager
+@torch.no_grad()
+def evaluate_model(
+    model: torch.nn.Module,
+    dataset_loader: DatasetLoader,
+    batch_size: int,
+    ctx,
+    eval_iters: int,
+) -> Optional[float]:
+    if not dataset_loader.has_split("val"):
+        return None
+
+    device = next(model.parameters()).device
+    losses: List[float] = []
+    model.eval()
+    try:
+        for _ in range(eval_iters):
+            x_val, y_val = dataset_loader.get_batch("val", batch_size)
+            x_val = x_val.to(device)
+            y_val = y_val.to(device)
+            with ctx:
+                _, loss = model(x_val, y_val)
+            losses.append(loss.item())
+    finally:
+        model.train()
+
+    if not losses:
+        return None
+    return float(np.mean(losses))
 
 
 def main() -> None:
@@ -166,17 +229,54 @@ def main() -> None:
     dtype, ctx, scaler = setup_precision(device)
     print(f"Using device: {device} with dtype {dtype}")
 
-    tokenizer_manager = init_tokenizer_manager(args)
+    checkpoint_manager = CheckpointManager(
+        checkpoint_dir=Path(args.checkpoint_dir),
+        keep_last_n=args.keep_last_n,
+    )
+    resume_state: Optional[Dict] = None
+    checkpoint_state: Optional[CheckpointState] = None
+    if args.resume or args.checkpoint_path:
+        checkpoint_state = checkpoint_manager.load_checkpoint(args.checkpoint_path)
+        if checkpoint_state is not None:
+            resume_state = checkpoint_state.state
+            print(f"Resuming from checkpoint: {checkpoint_state.path}")
+        else:
+            print("No checkpoint found for resume request; starting fresh.")
 
-    bdh_config = bdh.BDHConfig()
-    bdh_config.vocab_size = tokenizer_manager.vocab_size
-    bdh_config.tokenizer_type = tokenizer_manager.tokenizer_type
-    bdh_config.tokenizer_vocab_size = tokenizer_manager.vocab_size
-    bdh_config.tokenizer_path = args.tokenizer_path or tokenizer_manager.tokenizer_path
-    bdh_config.bos_token_id = tokenizer_manager.bos_token_id
-    bdh_config.eos_token_id = tokenizer_manager.eos_token_id
-    bdh_config.pad_token_id = tokenizer_manager.pad_token_id
-    bdh_config.unk_token_id = tokenizer_manager.unk_token_id
+    # Determine tokenizer configuration (checkpoint values take precedence).
+    resume_config: Optional[Dict] = None
+    if resume_state and "config" in resume_state:
+        resume_config = resume_state["config"]
+
+    tokenizer_path = args.tokenizer_path or (resume_config.get("tokenizer_path") if resume_config else None)
+    tokenizer_type = resume_config.get("tokenizer_type") if resume_config else args.tokenizer_type
+    tokenizer_vocab_size = resume_config.get("tokenizer_vocab_size") if resume_config else args.tokenizer_vocab_size
+
+    if tokenizer_path:
+        tokenizer_manager = TokenizerManager.from_directory(tokenizer_path)
+    else:
+        tokenizer_manager = TokenizerManager(
+            tokenizer_type=tokenizer_type,
+            vocab_size=tokenizer_vocab_size,
+        )
+        if tokenizer_manager.tokenizer_type != "byte":
+            raise ValueError(
+                "A trained tokenizer path is required for non-byte tokenizers. "
+                "Provide --tokenizer_path or resume from a checkpoint with tokenizer metadata."
+            )
+
+    if resume_config:
+        bdh_config = bdh.BDHConfig(**resume_config)
+    else:
+        bdh_config = bdh.BDHConfig()
+        bdh_config.vocab_size = tokenizer_manager.vocab_size
+        bdh_config.tokenizer_type = tokenizer_manager.tokenizer_type
+        bdh_config.tokenizer_vocab_size = tokenizer_manager.vocab_size
+        bdh_config.tokenizer_path = tokenizer_path or tokenizer_manager.tokenizer_path
+        bdh_config.bos_token_id = tokenizer_manager.bos_token_id
+        bdh_config.eos_token_id = tokenizer_manager.eos_token_id
+        bdh_config.pad_token_id = tokenizer_manager.pad_token_id
+        bdh_config.unk_token_id = tokenizer_manager.unk_token_id
 
     model = bdh.BDH(bdh_config, tokenizer=tokenizer_manager).to(device)
     if hasattr(torch, "compile") and not args.no_compile:
@@ -202,12 +302,33 @@ def main() -> None:
     dataset_loader = DatasetLoader(loader_config)
     dataset_loader.load_dataset()
 
+    start_step = 0
+    best_val_loss = float("inf")
+    train_loss_history: List[Dict[str, float]] = []
+    if resume_state:
+        if "model_state_dict" in resume_state:
+            model.load_state_dict(resume_state["model_state_dict"])
+        if "optimizer_state_dict" in resume_state:
+            optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+        if "scaler_state_dict" in resume_state:
+            scaler.load_state_dict(resume_state["scaler_state_dict"])
+        start_step = resume_state.get("step", 0)
+        best_val_loss = resume_state.get("best_val_loss", float("inf"))
+        train_loss_history = resume_state.get("loss_history", [])
+        if "rng_state" in resume_state:
+            torch.set_rng_state(resume_state["rng_state"])
+        cuda_rng_state = resume_state.get("cuda_rng_state")
+        if cuda_rng_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state(cuda_rng_state)
+        print(f"Resumed training from step {start_step}")
+
     model.train()
     x, y = dataset_loader.get_batch("train", args.batch_size)
 
     loss_acc = 0.0
     loss_steps = 0
-    for step in range(args.max_iters):
+    last_checkpoint_step = start_step
+    for step in range(start_step, args.max_iters):
         with ctx:
             logits, loss = model(x, y)
         x, y = dataset_loader.get_batch("train", args.batch_size)
@@ -219,14 +340,72 @@ def main() -> None:
         scaler.update()
         optimizer.zero_grad()
 
-        if step % args.log_freq == 0:
+        global_step = step + 1
+
+        if global_step % args.log_freq == 0:
             avg_loss = loss_acc / loss_steps if loss_steps else float("nan")
-            print(f"Step: {step}/{args.max_iters} loss {avg_loss:.3f}")
+            print(f"Step: {global_step}/{args.max_iters} loss {avg_loss:.3f}")
+            train_loss_history.append({"step": int(global_step), "loss": float(avg_loss)})
+            if len(train_loss_history) > 1000:
+                train_loss_history = train_loss_history[-1000:]
             loss_acc = 0.0
             loss_steps = 0
 
+        should_eval = args.eval_freq > 0 and global_step % args.eval_freq == 0
+        val_loss: Optional[float] = None
+        improved = False
+        if should_eval:
+            val_loss = evaluate_model(
+                model=model,
+                dataset_loader=dataset_loader,
+                batch_size=args.batch_size,
+                ctx=ctx,
+                eval_iters=args.eval_iters,
+            )
+            if val_loss is not None:
+                print(f"Step: {global_step} val_loss {val_loss:.4f}")
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    improved = True
+            else:
+                print("Validation split not available; skipping evaluation.")
+
+        should_save = args.save_freq > 0 and global_step % args.save_freq == 0
+        if should_save or improved:
+            state = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "step": global_step,
+                "config": dataclasses.asdict(bdh_config),
+                "train_args": vars(args),
+                "best_val_loss": best_val_loss,
+                "loss_history": train_loss_history,
+                "rng_state": torch.get_rng_state(),
+                "cuda_rng_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            }
+            is_best = improved
+            checkpoint_manager.save_checkpoint(state, global_step, is_best=is_best)
+            last_checkpoint_step = global_step
+
     if args.save_dir:
         model.save_pretrained(args.save_dir, tokenizer=tokenizer_manager)
+
+    # Ensure a final checkpoint exists for the completed run.
+    if last_checkpoint_step != args.max_iters:
+        final_state = {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "step": args.max_iters,
+            "config": dataclasses.asdict(bdh_config),
+            "train_args": vars(args),
+            "best_val_loss": best_val_loss,
+            "loss_history": train_loss_history,
+            "rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+        }
+        checkpoint_manager.save_checkpoint(final_state, args.max_iters, is_best=False)
 
     print("Training done, now generating a sample")
     model.eval()
