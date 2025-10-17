@@ -2,3 +2,4 @@ torch
 numpy
 requests
 datasets>=2.14.0
+tokenizers>=0.15.0

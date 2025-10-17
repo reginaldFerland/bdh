@@ -1,7 +1,9 @@
-# Copyright 2025 Pathway Technology, Inc.
-
 import dataclasses
+import json
 import math
+from dataclasses import asdict
+from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +18,13 @@ class BDHConfig:
     n_head: int = 4
     mlp_internal_dim_multiplier: int = 128
     vocab_size: int = 256
+    tokenizer_type: str = "byte"
+    tokenizer_vocab_size: int = 256
+    tokenizer_path: Optional[str] = None
+    bos_token_id: Optional[int] = None
+    eos_token_id: Optional[int] = None
+    pad_token_id: Optional[int] = None
+    unk_token_id: Optional[int] = None
 
 
 def get_freqs(n, theta, dtype):
@@ -69,16 +78,28 @@ class Attention(torch.nn.Module):
         QR = self.rope(r_phases, Q)
         KR = QR
 
-        # Current attention
         scores = (QR @ KR.mT).tril(diagonal=-1)
         return scores @ V
 
 
 class BDH(nn.Module):
-    def __init__(self, config: BDHConfig):
+    def __init__(self, config: BDHConfig, tokenizer: Optional[object] = None):
         super().__init__()
         assert config.vocab_size is not None
+
+        if tokenizer is not None:
+            vocab_size = getattr(tokenizer, "vocab_size", config.vocab_size)
+            config.vocab_size = int(vocab_size)
+            config.tokenizer_vocab_size = int(vocab_size)
+            config.tokenizer_type = getattr(tokenizer, "tokenizer_type", config.tokenizer_type)
+            config.bos_token_id = getattr(tokenizer, "bos_token_id", config.bos_token_id)
+            config.eos_token_id = getattr(tokenizer, "eos_token_id", config.eos_token_id)
+            config.pad_token_id = getattr(tokenizer, "pad_token_id", config.pad_token_id)
+            config.unk_token_id = getattr(tokenizer, "unk_token_id", config.unk_token_id)
+
         self.config = config
+        self.tokenizer = tokenizer
+
         nh = config.n_head
         D = config.n_embd
         N = config.mlp_internal_dim_multiplier * D // nh
@@ -115,11 +136,9 @@ class BDH(nn.Module):
         N = D * C.mlp_internal_dim_multiplier // nh
 
         x = self.embed(idx).unsqueeze(1)
-
-        # actually helps with training
         x = self.ln(x)  # B, 1, T, D
 
-        for level in range(C.n_layer):
+        for _ in range(C.n_layer):
             x_latent = x @ self.encoder
 
             x_sparse = F.relu(x_latent)  # B, nh, T, N
@@ -156,11 +175,10 @@ class BDH(nn.Module):
         idx: torch.Tensor,
         max_new_tokens: int,
         temperature: float = 1.0,
-        top_k: int | None = None,
+        top_k: Optional[int] = None,
     ) -> torch.Tensor:
         for _ in range(max_new_tokens):
-            idx_cond = idx
-            logits, _ = self(idx_cond)
+            logits, _ = self(idx)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -169,3 +187,87 @@ class BDH(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
+
+    @torch.no_grad()
+    def generate_text(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+    ) -> str:
+        if self.tokenizer is None or not hasattr(self.tokenizer, "encode"):
+            raise ValueError("A tokenizer is required to generate text prompts.")
+
+        self.eval()
+        device = next(self.parameters()).device
+        prompt_tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
+        prompt_tensor = torch.tensor(
+            prompt_tokens,
+            dtype=torch.long,
+            device=device,
+        ).unsqueeze(0)
+        generated = self.generate(
+            prompt_tensor,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        full_tokens = generated[0].tolist()
+        continuation_tokens = full_tokens[len(prompt_tokens) :]
+        continuation = self.tokenizer.decode(continuation_tokens)
+        return prompt + continuation
+
+    def save_pretrained(
+        self,
+        save_directory: str | Path,
+        *,
+        tokenizer: Optional[object] = None,
+    ) -> Path:
+        save_path = Path(save_directory)
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        tokenizer_to_save = tokenizer or self.tokenizer
+        if tokenizer_to_save is not None and hasattr(tokenizer_to_save, "save"):
+            tokenizer_dir = save_path / "tokenizer"
+            tokenizer_to_save.save(tokenizer_dir)
+            self.config.tokenizer_path = str(tokenizer_dir)
+
+        config_path = save_path / "config.json"
+        with config_path.open("w", encoding="utf-8") as f:
+            json.dump(asdict(self.config), f, indent=2, sort_keys=True)
+
+        model_path = save_path / "model.pt"
+        torch.save(self.state_dict(), model_path)
+        return save_path
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        directory: str | Path,
+        *,
+        device: Optional[torch.device] = None,
+    ) -> "BDH":
+        directory = Path(directory)
+        config_path = directory / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"Missing config at {config_path}")
+        with config_path.open("r", encoding="utf-8") as f:
+            config_data = json.load(f)
+        config = BDHConfig(**config_data)
+
+        tokenizer = None
+        tokenizer_dir = directory / "tokenizer"
+        if tokenizer_dir.exists():
+            from tokenizer_utils import TokenizerManager
+
+            tokenizer = TokenizerManager.from_directory(tokenizer_dir)
+
+        model = cls(config=config, tokenizer=tokenizer)
+        state_path = directory / "model.pt"
+        map_location = device if device is not None else "cpu"
+        state_dict = torch.load(state_path, map_location=map_location)
+        model.load_state_dict(state_dict)
+        if device is not None:
+            model.to(device)
+        return model
