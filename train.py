@@ -1,120 +1,179 @@
 # Copyright Pathway Technology, Inc.
 
-import os
+import argparse
 from contextlib import nullcontext
+from pathlib import Path
+
+import torch
 
 import bdh
-import numpy as np
-import requests
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# On a Mac you can also try
-# device=torch.device('mps')
-
-dtype = (
-    "bfloat16"
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    else "float16"
-)  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-ptdtype = {
-    "float32": torch.float32,
-    "bfloat16": torch.bfloat16,
-    "float16": torch.float16,
-}[dtype]
-ctx = (
-    torch.amp.autocast(device_type=device.type, dtype=ptdtype)
-    if "cuda" in device.type
-    else nullcontext()
-)
-scaler = torch.amp.GradScaler(device=device.type, enabled=(dtype == "float16"))
-torch.manual_seed(1337)
-torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
-print(f"Using device: {device} with dtype {dtype}")
+from data import DatasetLoader, DatasetLoaderConfig
 
 
-# Configuration
-BDH_CONFIG = bdh.BDHConfig()
-BLOCK_SIZE = 512
-BATCH_SIZE = 8
-MAX_ITERS = 30000
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 0.1
-LOG_FREQ = 100
-
-input_file_path = os.path.join(os.path.dirname(__file__), "input.txt")
-
-
-# Fetch the tiny Shakespeare dataset
-def fetch_data():
-    if not os.path.exists(input_file_path):
-        data_url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-        with open(input_file_path, "w") as f:
-            f.write(requests.get(data_url).text)
-
-
-def get_batch(split):
-    # treat the file as bytes
-    data = np.memmap(input_file_path, dtype=np.uint8, mode="r")
-    if split == "train":
-        data = data[: int(0.9 * len(data))]
-    else:
-        data = data[int(0.9 * len(data)) :]
-    ix = torch.randint(len(data) - BLOCK_SIZE, (BATCH_SIZE,))
-    x = torch.stack(
-        [torch.from_numpy((data[i : i + BLOCK_SIZE]).astype(np.int64)) for i in ix]
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train the BDH model.")
+    parser.add_argument(
+        "--dataset_name",
+        "--dataset-name",
+        default="shakespeare",
+        help="Dataset identifier (e.g. shakespeare, wikitext, openwebtext, c4).",
     )
-    y = torch.stack(
-        [
-            torch.from_numpy((data[i + 1 : i + 1 + BLOCK_SIZE]).astype(np.int64))
-            for i in ix
-        ]
+    parser.add_argument(
+        "--dataset_config",
+        "--dataset-config",
+        default=None,
+        help="Optional dataset configuration/subset name (e.g. wikitext-103-raw-v1, en).",
     )
-    if torch.cuda.is_available():
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(
-            device, non_blocking=True
-        )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Enable datasets streaming mode for large corpora.",
+    )
+    parser.add_argument(
+        "--text_column",
+        "--text-column",
+        default=None,
+        help="Column containing text (defaults to common names like 'text').",
+    )
+    parser.add_argument(
+        "--block_size",
+        "--block-size",
+        type=int,
+        default=512,
+        help="Context window size for language modelling.",
+    )
+    parser.add_argument(
+        "--train_split",
+        "--train-split",
+        type=float,
+        default=0.9,
+        help="Fraction of data to use for training when splitting automatically.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Number of sequences per optimisation step.",
+    )
+    parser.add_argument(
+        "--max_iters",
+        "--max-iters",
+        type=int,
+        default=300,
+        help="Total optimisation steps.",
+    )
+    parser.add_argument(
+        "--log_freq",
+        "--log-freq",
+        type=int,
+        default=100,
+        help="Logging frequency measured in optimisation steps.",
+    )
+    parser.add_argument(
+        "--learning_rate",
+        "--learning-rate",
+        type=float,
+        default=1e-3,
+        help="AdamW learning rate.",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        "--weight-decay",
+        type=float,
+        default=0.1,
+        help="AdamW weight decay.",
+    )
+    parser.add_argument(
+        "--no_compile",
+        action="store_true",
+        help="Disable torch.compile for environments where it is unavailable.",
+    )
+    return parser.parse_args()
+
+
+def setup_precision(device: torch.device):
+    if device.type == "cuda":
+        dtype = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
     else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+        dtype = "float32"
+    ptdtype = {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }[dtype]
+    ctx = (
+        torch.amp.autocast(device_type=device.type, dtype=ptdtype)
+        if device.type == "cuda"
+        else nullcontext()
+    )
+    scaler = torch.amp.GradScaler(device=device.type, enabled=(dtype == "float16"))
+    return dtype, ctx, scaler
 
 
-def eval(model):
-    model.eval()
+def main() -> None:
+    args = parse_args()
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(1337)
 
-if __name__ == "__main__":
-    fetch_data()
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
-    model = bdh.BDH(BDH_CONFIG).to(device)
-    model = torch.compile(model)
+    dtype, ctx, scaler = setup_precision(device)
+    print(f"Using device: {device} with dtype {dtype}")
+
+    bdh_config = bdh.BDHConfig()
+    model = bdh.BDH(bdh_config).to(device)
+    if hasattr(torch, "compile") and not args.no_compile:
+        model = torch.compile(model)
+
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
 
-    x, y = get_batch("train")
+    loader_config = DatasetLoaderConfig(
+        dataset_name=args.dataset_name,
+        dataset_config=args.dataset_config,
+        streaming=args.streaming,
+        text_column=args.text_column,
+        block_size=args.block_size,
+        train_split=args.train_split,
+        data_dir=Path(__file__).resolve().parent,
+        device=device,
+    )
+    dataset_loader = DatasetLoader(loader_config)
+    # Example CLI usage:
+    #   python train.py --dataset_name shakespeare
+    #   python train.py --dataset_name wikitext --dataset_config wikitext-103-raw-v1 --text_column text
+    #   python train.py --dataset_name openwebtext --text_column text --streaming
+    #   python train.py --dataset_name c4 --dataset_config en --text_column text --streaming
+    dataset_loader.load_dataset()
 
-    loss_acc = 0
+    x, y = dataset_loader.get_batch("train", args.batch_size)
+
+    loss_acc = 0.0
     loss_steps = 0
-    for step in range(MAX_ITERS):
+    for step in range(args.max_iters):
         with ctx:
             logits, loss = model(x, y)
-        x, y = get_batch("train")
-        loss_acc += loss
+        x, y = dataset_loader.get_batch("train", args.batch_size)
+        loss_acc += loss.item()
         loss_steps += 1
+
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad()
-        if step % LOG_FREQ == 0:
-            print(f"Step: {step}/{MAX_ITERS} loss {loss_acc.item() / loss_steps:.3}")
-            loss_acc = 0
+
+        if step % args.log_freq == 0:
+            avg_loss = loss_acc / loss_steps if loss_steps else float("nan")
+            print(f"Step: {step}/{args.max_iters} loss {avg_loss:.3f}")
+            loss_acc = 0.0
             loss_steps = 0
-    print("Training done, now generating a sample ")
+
+    print("Training done, now generating a sample")
     model.eval()
     prompt = torch.tensor(
         bytearray("To be or ", "utf-8"), dtype=torch.long, device=device
@@ -124,3 +183,7 @@ if __name__ == "__main__":
         errors="backslashreplace"
     )
     print(ret_decoded)
+
+
+if __name__ == "__main__":
+    main()
