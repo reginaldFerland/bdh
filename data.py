@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -36,6 +36,9 @@ class DatasetLoaderConfig:
     train_split: float = 0.9
     data_dir: Optional[Path] = None
     device: Optional[torch.device] = None
+    cache_dir: Optional[Path] = None
+    seed: int = 42
+    show_progress: bool = True
 
 
 class DatasetLoader:
@@ -55,10 +58,9 @@ class DatasetLoader:
 
         self._train_array: Optional[np.ndarray] = None
         self._val_array: Optional[np.ndarray] = None
-        self._train_stream: Optional[Iterable] = None
-        self._val_stream: Optional[Iterable] = None
         self._stream_iters: Dict[str, Iterator] = {}
         self._stream_buffers: Dict[str, List[int]] = {"train": [], "val": []}
+        self._stream_builders: Dict[str, Callable[[], Iterable]] = {}
 
         self._separator_tokens = self._compute_separator_tokens()
         self._rng = np.random.default_rng()
@@ -67,6 +69,8 @@ class DatasetLoader:
     def load_dataset(self) -> None:
         if self.dataset_name in {"shakespeare", "tinyshakespeare"}:
             self._load_shakespeare()
+            self._validate_loaded_data()
+            self._log_dataset_info()
             return
 
         if load_dataset is None:
@@ -77,8 +81,11 @@ class DatasetLoader:
 
         if self.streaming:
             self._load_hf_streaming()
+            self._log_dataset_info()
         else:
             self._load_hf_in_memory()
+            self._validate_loaded_data()
+            self._log_dataset_info()
 
     def get_batch(self, split: str, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if split not in {"train", "val"}:
@@ -137,22 +144,17 @@ class DatasetLoader:
         base_split = "train" if "train" in available_splits else available_splits[0]
         train_slice, val_slice = self._streaming_splits(base_split)
 
-        self._train_stream = load_dataset(
-            self.dataset_name,
-            self.dataset_config,
-            split=train_slice,
-            streaming=True,
-        )
-        self._val_stream = (
-            load_dataset(
-                self.dataset_name,
-                self.dataset_config,
-                split=val_slice,
-                streaming=True,
-            )
-            if val_slice is not None
-            else None
-        )
+        self._stream_builders = {
+            "train": self._build_stream_loader(train_slice),
+        }
+        if val_slice is not None:
+            self._stream_builders["val"] = self._build_stream_loader(val_slice)
+        else:
+            self._stream_builders.pop("val", None)
+        self._stream_iters.clear()
+        self._stream_buffers = {"train": []}
+        if "val" in self._stream_builders:
+            self._stream_buffers["val"] = []
 
     # ----------------------------------------------------------- Batch generation
     def _in_memory_batch(self, split: str, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -170,58 +172,82 @@ class DatasetLoader:
             )
 
         starts = self._rng.integers(0, max_start, size=batch_size)
-        x_list = []
-        y_list = []
-        for start in starts:
-            chunk = data[start : start + self.block_size + 1]
-            x_list.append(torch.from_numpy(chunk[:-1]))
-            y_list.append(torch.from_numpy(chunk[1:]))
-
-        x = torch.stack(x_list)
-        y = torch.stack(y_list)
-        return self._move_to_device(x, y)
+        
+        # Optimize tensor creation for CUDA by pre-allocating in pinned memory
+        if self.device and self.device.type == "cuda":
+            x = torch.empty((batch_size, self.block_size), dtype=torch.long, pin_memory=True)
+            y = torch.empty((batch_size, self.block_size), dtype=torch.long, pin_memory=True)
+            for i, start in enumerate(starts):
+                chunk = data[start : start + self.block_size + 1]
+                x[i] = torch.from_numpy(chunk[:-1])
+                y[i] = torch.from_numpy(chunk[1:])
+            return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+        else:
+            # Standard path for CPU or when device is not set
+            x_list = []
+            y_list = []
+            for start in starts:
+                chunk = data[start : start + self.block_size + 1]
+                x_list.append(torch.from_numpy(chunk[:-1]))
+                y_list.append(torch.from_numpy(chunk[1:]))
+            
+            x = torch.stack(x_list)
+            y = torch.stack(y_list)
+            return self._move_to_device(x, y)
 
     def _streaming_batch(self, split: str, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        stream = self._train_stream if split == "train" else self._val_stream
-        if stream is None:
+        builder = self._stream_builders.get(split)
+        if builder is None:
             raise ValueError(f"Streaming dataset for split '{split}' is not available.")
 
         buffer = self._stream_buffers.setdefault(split, [])
-        samples = []
         tokens_needed = self.block_size + 1
+        
+        # Collect all samples first
+        all_samples = []
         for _ in range(batch_size):
-            sample_tokens = self._next_stream_sample(split, stream, buffer, tokens_needed)
-            x = torch.tensor(sample_tokens[:-1], dtype=torch.long)
-            y = torch.tensor(sample_tokens[1:], dtype=torch.long)
-            samples.append((x, y))
+            sample_tokens = self._next_stream_sample(split, builder, buffer, tokens_needed)
+            all_samples.append(sample_tokens)
 
-        x_batch = torch.stack([s[0] for s in samples])
-        y_batch = torch.stack([s[1] for s in samples])
+        # Convert to tensors in batches for better performance
+        x_batch = torch.tensor([s[:-1] for s in all_samples], dtype=torch.long)
+        y_batch = torch.tensor([s[1:] for s in all_samples], dtype=torch.long)
         return self._move_to_device(x_batch, y_batch)
 
     def _next_stream_sample(
         self,
         split: str,
-        stream: Iterable,
+        builder: Callable[[], Iterable],
         buffer: List[int],
         required: int,
     ) -> List[int]:
         iterator = self._stream_iters.get(split)
         if iterator is None:
-            iterator = iter(stream)
+            iterator = iter(builder())
             self._stream_iters[split] = iterator
+
+        empty_records = 0
+        max_empty = 1000  # Prevent infinite loops on bad data
 
         while len(buffer) < required:
             try:
                 record = next(iterator)
             except StopIteration:
-                iterator = iter(stream)
+                iterator = iter(builder())
                 self._stream_iters[split] = iterator
                 continue
 
             text = self._extract_text(record)
             if not text:
+                empty_records += 1
+                if empty_records > max_empty:
+                    raise ValueError(
+                        f"Found {max_empty} consecutive empty records in "
+                        f"streaming dataset split '{split}'. Data may be invalid."
+                    )
                 continue
+            
+            empty_records = 0  # Reset on valid record
             encoded = self._encode_text(text)
             if not encoded:
                 continue
@@ -237,11 +263,54 @@ class DatasetLoader:
     def has_split(self, split: str) -> bool:
         if split == "train":
             has_array = self._train_array is not None and len(self._train_array) > self.block_size
-            return has_array or (self._train_stream is not None)
+            return has_array or ("train" in self._stream_builders)
         if split == "val":
             has_array = self._val_array is not None and len(self._val_array) > self.block_size
-            return has_array or (self._val_stream is not None)
+            return has_array or ("val" in self._stream_builders)
         raise ValueError(f"Unknown split '{split}'. Expected 'train' or 'val'.")
+
+    def _validate_loaded_data(self) -> None:
+        """Validate that loaded datasets have sufficient tokens for the configured block size."""
+        min_size = self.block_size + 1
+        
+        if self._train_array is not None:
+            train_size = len(self._train_array)
+            if train_size < min_size:
+                raise ValueError(
+                    f"Training data has {train_size} tokens but requires at least "
+                    f"{min_size} tokens (block_size={self.block_size} + 1). "
+                    f"Consider reducing --block-size or using more training data."
+                )
+        
+        if self._val_array is not None:
+            val_size = len(self._val_array)
+            if val_size < min_size:
+                raise ValueError(
+                    f"Validation data has {val_size} tokens but requires at least "
+                    f"{min_size} tokens (block_size={self.block_size} + 1). "
+                    f"Consider reducing --block-size or using more validation data."
+                )
+
+    def _log_dataset_info(self) -> None:
+        """Log information about the loaded dataset for debugging."""
+        mode = "streaming" if self.streaming else "in-memory"
+        print(f"Loaded dataset '{self.dataset_name}' in {mode} mode")
+        
+        if self._train_array is not None:
+            train_tokens = len(self._train_array)
+            train_batches = train_tokens // self.block_size
+            print(f"  Train: {train_tokens:,} tokens (~{train_batches:,} batches of size {self.block_size})")
+        elif "train" in self._stream_builders:
+            print(f"  Train: streaming mode (infinite batches of size {self.block_size})")
+        
+        if self._val_array is not None:
+            val_tokens = len(self._val_array)
+            val_batches = val_tokens // self.block_size
+            print(f"  Val: {val_tokens:,} tokens (~{val_batches:,} batches of size {self.block_size})")
+        elif "val" in self._stream_builders:
+            print(f"  Val: streaming mode (infinite batches of size {self.block_size})")
+        elif not self.has_split("val"):
+            print("  Val: not available")
 
     def _move_to_device(self, x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.device is None:
@@ -258,31 +327,39 @@ class DatasetLoader:
         self,
         dataset_dict: DatasetDict,
     ) -> Tuple[Dataset, Optional[Dataset]]:
-        if "train" in dataset_dict:
-            train_dataset = dataset_dict["train"]
-            val_dataset = dataset_dict.get("validation") or dataset_dict.get("val")
-            if val_dataset is None:
-                val_dataset = dataset_dict.get("test")
-            if val_dataset is None and self.train_split < 1.0:
-                split = train_dataset.train_test_split(
-                    test_size=1.0 - self.train_split,
-                    shuffle=True,
-                    seed=42,
-                )
-                return split["train"], split["test"]
-            return train_dataset, val_dataset
-
-        splits = list(dataset_dict.keys())
-        train_dataset = dataset_dict[splits[0]]
-        val_dataset = dataset_dict[splits[1]] if len(splits) > 1 else None
-        if val_dataset is None and self.train_split < 1.0:
-            split = train_dataset.train_test_split(
+        """Resolve train and validation splits from a HuggingFace DatasetDict.
+        
+        Returns the training dataset and optional validation dataset.
+        If no validation split exists and train_split < 1.0, automatically
+        splits the training data.
+        """
+        train_ds = self._get_train_dataset(dataset_dict)
+        
+        # Check for existing validation split
+        val_ds = None
+        for split_name in ("validation", "val", "test"):
+            if split_name in dataset_dict:
+                val_ds = dataset_dict[split_name]
+                break
+        
+        # Auto-split if no validation exists and train_split < 1.0
+        if val_ds is None and self.train_split < 1.0:
+            split = train_ds.train_test_split(
                 test_size=1.0 - self.train_split,
                 shuffle=True,
-                seed=42,
+                seed=self.config.seed,
             )
-            return split["train"], split["test"]
-        return train_dataset, val_dataset
+            train_ds = split["train"]
+            val_ds = split["test"]
+        
+        return train_ds, val_ds
+
+    def _get_train_dataset(self, dataset_dict: DatasetDict) -> Dataset:
+        """Extract the training dataset from a DatasetDict."""
+        if "train" in dataset_dict:
+            return dataset_dict["train"]
+        # Fallback to first available split
+        return dataset_dict[list(dataset_dict.keys())[0]]
 
     def _dataset_to_array(self, dataset: Dataset) -> np.ndarray:
         texts = (self._extract_text(record) for record in dataset)
@@ -296,6 +373,23 @@ class DatasetLoader:
         train_slice = f"{base_split}[:{train_pct}%]"
         val_slice = f"{base_split}[{train_pct}%:]"
         return train_slice, val_slice
+
+    def _build_stream_loader(self, dataset_slice: str) -> Callable[[], Iterable]:
+        if load_dataset is None:  # pragma: no cover - defensive guard
+            raise ImportError(
+                "datasets library is required for HuggingFace dataset support. "
+                "Install it with `pip install datasets>=2.14.0`."
+            )
+
+        def _loader() -> Iterable:
+            return load_dataset(
+                self.dataset_name,
+                self.dataset_config,
+                split=dataset_slice,
+                streaming=True,
+            )
+
+        return _loader
 
     def _extract_text(self, record: Dict) -> str:
         if self.text_column:
@@ -313,19 +407,26 @@ class DatasetLoader:
         return ""
 
     def _corpus_to_array(self, texts: Iterable[str]) -> np.ndarray:
-        buffer: List[int] = []
+        """Convert an iterable of texts into a single numpy array of token IDs.
+        
+        Uses numpy concatenation for better memory efficiency compared to 
+        accumulating in Python lists.
+        """
+        chunks: List[np.ndarray] = []
         for text in texts:
             if not text:
                 continue
             encoded = self._encode_text(text)
             if not encoded:
                 continue
-            buffer.extend(encoded)
+            # Add separator tokens if configured
             if self._separator_tokens:
-                buffer.extend(self._separator_tokens)
-        if not buffer:
+                encoded = encoded + self._separator_tokens
+            chunks.append(np.array(encoded, dtype=np.int64))
+        
+        if not chunks:
             return np.zeros(0, dtype=np.int64)
-        return np.array(buffer, dtype=np.int64)
+        return np.concatenate(chunks)
 
     def _encode_text(self, text: str) -> List[int]:
         if self.tokenizer is None:
