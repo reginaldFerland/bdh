@@ -33,6 +33,7 @@ class DatasetLoaderConfig:
     text_column: Optional[str] = None
     tokenizer_manager: Optional[TokenizerManager] = None
     block_size: int = 512
+    batch_size: int = 8
     train_split: float = 0.9
     data_dir: Optional[Path] = None
     device: Optional[torch.device] = None
@@ -48,6 +49,8 @@ class DatasetLoader:
         self.config = config
         self.data_dir = config.data_dir or Path(__file__).resolve().parent
         self.device = config.device
+        if self.device and not isinstance(self.device, torch.device):
+            self.device = torch.device(self.device)
         self.block_size = config.block_size
         self.train_split = max(0.0, min(config.train_split, 1.0))
         self.dataset_name = config.dataset_name.lower()
@@ -63,7 +66,7 @@ class DatasetLoader:
         self._stream_builders: Dict[str, Callable[[], Iterable]] = {}
 
         self._separator_tokens = self._compute_separator_tokens()
-        self._rng = np.random.default_rng()
+        self._rng = np.random.default_rng(config.seed)
 
     # ------------------------------------------------------------------ Public API
     def load_dataset(self) -> None:
@@ -94,6 +97,24 @@ class DatasetLoader:
         if self.streaming:
             return self._streaming_batch(split, batch_size)
         return self._in_memory_batch(split, batch_size)
+
+    def __iter__(self):
+        """Make the loader iterable for Pythonic usage.
+        
+        Allows usage like:
+            for x_batch, y_batch in dataset_loader:
+                # training code
+        """
+        self._iter_split = "train"
+        return self
+
+    def __next__(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the next batch from the training split.
+        
+        Uses the default batch_size from config if available, otherwise defaults to 8.
+        """
+        batch_size = getattr(self.config, 'batch_size', 8)
+        return self.get_batch(self._iter_split, batch_size)
 
     # ---------------------------------------------------------------- Shakespeare
     def _load_shakespeare(self) -> None:
@@ -127,8 +148,14 @@ class DatasetLoader:
             self.dataset_name,
             self.dataset_config,
             streaming=False,
+            cache_dir=str(self.config.cache_dir) if self.config.cache_dir else None,
         )
         train_dataset, val_dataset = self._resolve_splits(dataset_dict)
+        
+        # Shuffle training dataset for better training dynamics
+        if hasattr(train_dataset, 'shuffle'):
+            train_dataset = train_dataset.shuffle(seed=self.config.seed)
+        
         self._train_array = self._dataset_to_array(train_dataset)
         self._val_array = (
             self._dataset_to_array(val_dataset) if val_dataset is not None else None
@@ -139,6 +166,7 @@ class DatasetLoader:
             self.dataset_name,
             self.dataset_config,
             streaming=True,
+            cache_dir=str(self.config.cache_dir) if self.config.cache_dir else None,
         )
         available_splits = list(dataset_dict.keys())
         base_split = "train" if "train" in available_splits else available_splits[0]
@@ -173,27 +201,20 @@ class DatasetLoader:
 
         starts = self._rng.integers(0, max_start, size=batch_size)
         
-        # Optimize tensor creation for CUDA by pre-allocating in pinned memory
-        if self.device and self.device.type == "cuda":
-            x = torch.empty((batch_size, self.block_size), dtype=torch.long, pin_memory=True)
-            y = torch.empty((batch_size, self.block_size), dtype=torch.long, pin_memory=True)
-            for i, start in enumerate(starts):
-                chunk = data[start : start + self.block_size + 1]
-                x[i] = torch.from_numpy(chunk[:-1])
-                y[i] = torch.from_numpy(chunk[1:])
-            return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-        else:
-            # Standard path for CPU or when device is not set
-            x_list = []
-            y_list = []
-            for start in starts:
-                chunk = data[start : start + self.block_size + 1]
-                x_list.append(torch.from_numpy(chunk[:-1]))
-                y_list.append(torch.from_numpy(chunk[1:]))
-            
-            x = torch.stack(x_list)
-            y = torch.stack(y_list)
-            return self._move_to_device(x, y)
+        # Pre-allocate NumPy arrays for efficient batch construction
+        x_np = np.empty((batch_size, self.block_size), dtype=np.int64)
+        y_np = np.empty((batch_size, self.block_size), dtype=np.int64)
+        
+        for i, start in enumerate(starts):
+            chunk = data[start : start + self.block_size + 1]
+            x_np[i] = chunk[:-1]
+            y_np[i] = chunk[1:]
+        
+        # Ensure contiguous arrays for optimal PyTorch performance
+        x = torch.from_numpy(np.ascontiguousarray(x_np))
+        y = torch.from_numpy(np.ascontiguousarray(y_np))
+        
+        return self._move_to_device(x, y)
 
     def _streaming_batch(self, split: str, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
         builder = self._stream_builders.get(split)
@@ -209,9 +230,11 @@ class DatasetLoader:
             sample_tokens = self._next_stream_sample(split, builder, buffer, tokens_needed)
             all_samples.append(sample_tokens)
 
-        # Convert to tensors in batches for better performance
-        x_batch = torch.tensor([s[:-1] for s in all_samples], dtype=torch.long)
-        y_batch = torch.tensor([s[1:] for s in all_samples], dtype=torch.long)
+        # Use NumPy for efficient batch construction, then convert to torch once
+        x_np = np.array([s[:-1] for s in all_samples], dtype=np.int64)
+        y_np = np.array([s[1:] for s in all_samples], dtype=np.int64)
+        x_batch = torch.from_numpy(x_np)
+        y_batch = torch.from_numpy(y_np)
         return self._move_to_device(x_batch, y_batch)
 
     def _next_stream_sample(
@@ -226,8 +249,9 @@ class DatasetLoader:
             iterator = iter(builder())
             self._stream_iters[split] = iterator
 
-        empty_records = 0
-        max_empty = 1000  # Prevent infinite loops on bad data
+        consecutive_empty = 0
+        max_consecutive_empty = 100  # Prevent infinite loops on consecutive bad data
+        max_buffer_size = self.block_size * 100  # Prevent OOM from huge documents
 
         while len(buffer) < required:
             try:
@@ -235,25 +259,30 @@ class DatasetLoader:
             except StopIteration:
                 iterator = iter(builder())
                 self._stream_iters[split] = iterator
+                consecutive_empty = 0  # Reset counter on iterator restart
                 continue
 
             text = self._extract_text(record)
             if not text:
-                empty_records += 1
-                if empty_records > max_empty:
+                consecutive_empty += 1
+                if consecutive_empty >= max_consecutive_empty:
                     raise ValueError(
-                        f"Found {max_empty} consecutive empty records in "
-                        f"streaming dataset split '{split}'. Data may be invalid."
+                        f"Found {max_consecutive_empty} consecutive empty records in "
+                        f"streaming dataset split '{split}'. Data may be corrupted."
                     )
                 continue
             
-            empty_records = 0  # Reset on valid record
+            consecutive_empty = 0  # Reset on valid record
             encoded = self._encode_text(text)
             if not encoded:
                 continue
             buffer.extend(encoded)
             if self._separator_tokens:
                 buffer.extend(self._separator_tokens)
+            
+            # Prevent buffer from growing too large (OOM protection)
+            if len(buffer) > max_buffer_size:
+                break
 
         sample = buffer[:required]
         del buffer[:required]
