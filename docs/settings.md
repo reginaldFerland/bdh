@@ -334,6 +334,36 @@ These settings control the training process, hardware utilization, and optimizat
 
 ---
 
+### `log_dir: str = "logs"`
+
+**Description:** Directory path where training logs are saved. Each training run creates a new log file with a timestamp in the format `YYYY-MM-DD_HH-MM-SS.log`.
+
+**Impact on Training:**
+- **Monitoring:** All training output is logged to both console and file
+- **Performance:** Minimal overhead from file I/O
+- **Memory Usage:** None
+- **Persistence:** Enables reviewing training runs after completion
+
+**Impact on Final Model:**
+- **Parameter Count:** None
+- **Model Quality:** None - purely for monitoring and debugging
+
+**Log Contents:**
+- Device and precision configuration
+- Training loss at each `LOG_FREQ` interval
+- Validation loss at each evaluation
+- Checkpoint save events
+- Model generation samples
+- Training completion status
+
+**Typical Values:**
+- Default: `"logs"`
+- Custom: Any directory path (e.g., `"experiments/run_001"`)
+
+**Recommendation:** Use the default unless organizing multiple experiments or running on shared systems where you need separate log directories.
+
+---
+
 ## System Configuration
 
 These settings are automatically detected or configured based on hardware.

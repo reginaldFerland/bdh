@@ -2,7 +2,11 @@
 
 import argparse
 import dataclasses
+import logging
+import sys
+import time
 from contextlib import nullcontext
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -13,6 +17,44 @@ import bdh
 from checkpoint import CheckpointManager, CheckpointState
 from data import DatasetLoader, DatasetLoaderConfig
 from tokenizer_utils import TokenizerManager
+
+
+def setup_logging(log_dir: Path = Path("logs")) -> logging.Logger:
+    """Setup logging to both console and a date-stamped log file."""
+    log_dir.mkdir(exist_ok=True)
+    
+    # Create log filename with current date and time
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_file = log_dir / f"{timestamp}.log"
+    
+    # Configure logging
+    logger = logging.getLogger("bdh_training")
+    logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers to avoid duplicates
+    logger.handlers.clear()
+    
+    # File handler
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(logging.INFO)
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter('%(message)s')
+    console_handler.setFormatter(console_formatter)
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    logger.info(f"Logging to file: {log_file}")
+    
+    return logger
 
 
 def parse_args() -> argparse.Namespace:
@@ -164,7 +206,55 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="Number of validation batches per evaluation.",
     )
+    parser.add_argument(
+        "--log_dir",
+        "--log-dir",
+        default="logs",
+        help="Directory for saving training logs.",
+    )
     return parser.parse_args()
+
+
+def _strip_compiled_prefix(state_dict: Dict) -> Dict:
+    """Remove _orig_mod. prefix from compiled model state dict keys."""
+    return {
+        k.replace("_orig_mod.", ""): v 
+        for k, v in state_dict.items()
+    }
+
+
+def _build_checkpoint_state(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    global_step: int,
+    bdh_config: bdh.BDHConfig,
+    args: argparse.Namespace,
+    best_val_loss: float,
+    train_loss_history: List[Dict[str, float]],
+    training_start_time: float,
+) -> Dict:
+    """Build checkpoint state dictionary with versioning and metadata."""
+    # Handle torch.compile by stripping _orig_mod. prefix
+    model_state = model.state_dict()
+    if any(k.startswith("_orig_mod.") for k in model_state.keys()):
+        model_state = _strip_compiled_prefix(model_state)
+    
+    return {
+        "checkpoint_version": 1,
+        "timestamp": datetime.now().isoformat(),
+        "elapsed_time": time.time() - training_start_time,
+        "model_state_dict": model_state,
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "step": global_step,
+        "config": dataclasses.asdict(bdh_config),
+        "train_args": vars(args),
+        "best_val_loss": best_val_loss,
+        "loss_history": train_loss_history,
+        "rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+    }
 
 
 def setup_precision(device: torch.device):
@@ -218,6 +308,9 @@ def evaluate_model(
 
 def main() -> None:
     args = parse_args()
+    
+    # Setup logging
+    logger = setup_logging(log_dir=Path(args.log_dir))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(1337)
@@ -227,7 +320,7 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = True
 
     dtype, ctx, scaler = setup_precision(device)
-    print(f"Using device: {device} with dtype {dtype}")
+    logger.info(f"Using device: {device} with dtype {dtype}")
 
     checkpoint_manager = CheckpointManager(
         checkpoint_dir=Path(args.checkpoint_dir),
@@ -239,9 +332,9 @@ def main() -> None:
         checkpoint_state = checkpoint_manager.load_checkpoint(args.checkpoint_path)
         if checkpoint_state is not None:
             resume_state = checkpoint_state.state
-            print(f"Resuming from checkpoint: {checkpoint_state.path}")
+            logger.info(f"Resuming from checkpoint: {checkpoint_state.path}")
         else:
-            print("No checkpoint found for resume request; starting fresh.")
+            logger.info("No checkpoint found for resume request; starting fresh.")
 
     # Determine tokenizer configuration (checkpoint values take precedence).
     resume_config: Optional[Dict] = None
@@ -305,6 +398,7 @@ def main() -> None:
     start_step = 0
     best_val_loss = float("inf")
     train_loss_history: List[Dict[str, float]] = []
+    training_start_time = time.time()
     if resume_state:
         if "model_state_dict" in resume_state:
             model.load_state_dict(resume_state["model_state_dict"])
@@ -315,12 +409,15 @@ def main() -> None:
         start_step = resume_state.get("step", 0)
         best_val_loss = resume_state.get("best_val_loss", float("inf"))
         train_loss_history = resume_state.get("loss_history", [])
+        # Preserve elapsed time from previous run
+        if "elapsed_time" in resume_state:
+            training_start_time = time.time() - resume_state["elapsed_time"]
         if "rng_state" in resume_state:
             torch.set_rng_state(resume_state["rng_state"])
         cuda_rng_state = resume_state.get("cuda_rng_state")
         if cuda_rng_state is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state(cuda_rng_state)
-        print(f"Resumed training from step {start_step}")
+        logger.info(f"Resumed training from step {start_step}")
 
     model.train()
     x, y = dataset_loader.get_batch("train", args.batch_size)
@@ -344,7 +441,7 @@ def main() -> None:
 
         if global_step % args.log_freq == 0:
             avg_loss = loss_acc / loss_steps if loss_steps else float("nan")
-            print(f"Step: {global_step}/{args.max_iters} loss {avg_loss:.3f}")
+            logger.info(f"Step: {global_step}/{args.max_iters} loss {avg_loss:.3f}")
             train_loss_history.append({"step": int(global_step), "loss": float(avg_loss)})
             if len(train_loss_history) > 1000:
                 train_loss_history = train_loss_history[-1000:]
@@ -363,27 +460,43 @@ def main() -> None:
                 eval_iters=args.eval_iters,
             )
             if val_loss is not None:
-                print(f"Step: {global_step} val_loss {val_loss:.4f}")
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     improved = True
             else:
-                print("Validation split not available; skipping evaluation.")
+                logger.info("Validation split not available; skipping evaluation.")
+            
+            # Generate a sample prompt
+            model.eval()
+            prompt_text = "Who was the first US president?"
+            prompt_tokens = tokenizer_manager.encode(prompt_text, add_special_tokens=False)
+            prompt_tensor = torch.tensor(
+                prompt_tokens,
+                dtype=torch.long,
+                device=device,
+            ).unsqueeze(0)
+            with torch.no_grad():
+                ret = model.generate(prompt_tensor, max_new_tokens=50, top_k=3)
+            generated_tokens = ret[0].tolist()
+            prompt_length = len(prompt_tokens)
+            continuation_tokens = generated_tokens[prompt_length:]
+            continuation = tokenizer_manager.decode(continuation_tokens)
+            logger.info(f"Sample generation: {prompt_text + continuation}")
+            model.train()
 
         should_save = args.save_freq > 0 and global_step % args.save_freq == 0
         if should_save or improved:
-            state = {
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "step": global_step,
-                "config": dataclasses.asdict(bdh_config),
-                "train_args": vars(args),
-                "best_val_loss": best_val_loss,
-                "loss_history": train_loss_history,
-                "rng_state": torch.get_rng_state(),
-                "cuda_rng_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-            }
+            state = _build_checkpoint_state(
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                global_step=global_step,
+                bdh_config=bdh_config,
+                args=args,
+                best_val_loss=best_val_loss,
+                train_loss_history=train_loss_history,
+                training_start_time=training_start_time,
+            )
             is_best = improved
             checkpoint_manager.save_checkpoint(state, global_step, is_best=is_best)
             last_checkpoint_step = global_step
@@ -393,21 +506,20 @@ def main() -> None:
 
     # Ensure a final checkpoint exists for the completed run.
     if last_checkpoint_step != args.max_iters:
-        final_state = {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "step": args.max_iters,
-            "config": dataclasses.asdict(bdh_config),
-            "train_args": vars(args),
-            "best_val_loss": best_val_loss,
-            "loss_history": train_loss_history,
-            "rng_state": torch.get_rng_state(),
-            "cuda_rng_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-        }
+        final_state = _build_checkpoint_state(
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            global_step=args.max_iters,
+            bdh_config=bdh_config,
+            args=args,
+            best_val_loss=best_val_loss,
+            train_loss_history=train_loss_history,
+            training_start_time=training_start_time,
+        )
         checkpoint_manager.save_checkpoint(final_state, args.max_iters, is_best=False)
 
-    print("Training done, now generating a sample")
+    logger.info("Training done, now generating a sample")
     model.eval()
     prompt_text = "To be or "
     prompt_tokens = tokenizer_manager.encode(prompt_text, add_special_tokens=False)
@@ -421,7 +533,7 @@ def main() -> None:
     prompt_length = len(prompt_tokens)
     continuation_tokens = generated_tokens[prompt_length:]
     continuation = tokenizer_manager.decode(continuation_tokens)
-    print(prompt_text + continuation)
+    logger.info(f"Generated sample: {prompt_text + continuation}")
 
 
 if __name__ == "__main__":

@@ -59,6 +59,9 @@ pip install -r requirements.txt
 # train BDH on a toy dataset
 python train.py
 
+# train with custom log directory
+python train.py --log_dir my_training_logs
+
 # run tests
 ./run_tests.sh
 # or individually
@@ -67,6 +70,8 @@ python tests/test_new_features.py
 ```
 
 See the `tests/` directory for test documentation and the `examples/` directory for advanced training scripts.
+
+**Training Logs**: All training runs automatically log to date-stamped files in the `logs/` directory (or a custom directory specified with `--log_dir`). Each log file contains timestamped entries for training progress, validation metrics, and checkpointing events.
 
 <!--For visualization and interpretability analysis, explore the example notebooks in `notebooks/`.-->
 

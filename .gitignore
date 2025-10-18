@@ -2,3 +2,4 @@ input.txt
 __pycache__/
 tokenizers/
 checkpoints/
+logs/
