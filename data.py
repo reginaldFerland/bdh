@@ -10,7 +10,7 @@ import numpy as np
 import requests
 import torch
 
-from tokenizer_utils import TokenizerManager
+from tokenizer_utils import TokenizerManager, extract_text_from_record, DEFAULT_TEXT_COLUMNS
 
 if TYPE_CHECKING:
     from datasets import Dataset, DatasetDict
@@ -58,7 +58,6 @@ class DatasetLoader:
     MAX_CONSECUTIVE_EMPTY_RECORDS = 100
     MAX_TOTAL_STREAM_ATTEMPTS = 1000
     STREAM_BUFFER_SIZE_MULTIPLIER = 100
-    DEFAULT_PRIORITY_COLUMNS = ("text", "content", "article", "body")
 
     def __init__(self, config: DatasetLoaderConfig):
         self.config = config
@@ -365,7 +364,7 @@ class DatasetLoader:
                 continue
 
             # Extract and validate text from record
-            text = self._extract_text(record)
+            text = extract_text_from_record(record, self.text_column)
             if not text:
                 consecutive_empty += 1
                 if consecutive_empty >= self.MAX_CONSECUTIVE_EMPTY_RECORDS:
@@ -543,7 +542,7 @@ class DatasetLoader:
         return dataset_dict[list(dataset_dict.keys())[0]]
 
     def _dataset_to_array(self, dataset: "Dataset") -> np.ndarray:
-        texts = (self._extract_text(record) for record in dataset)
+        texts = (extract_text_from_record(record, self.text_column) for record in dataset)
         return self._corpus_to_array(texts)
 
     def _streaming_splits(self, base_split: str) -> Tuple[str, Optional[str]]:
@@ -579,31 +578,6 @@ class DatasetLoader:
             )
 
         return _loader
-
-    def _extract_text(self, record: Dict) -> str:
-        """Extract text from a dataset record with priority column detection.
-        
-        If text_column is specified, use that. Otherwise, check priority columns
-        first ('text', 'content', 'article', 'body'), then any string value.
-        
-        Args:
-            record: Dataset record dictionary
-            
-        Returns:
-            Extracted text string, or empty string if no valid text found
-        """
-        # Explicit column takes precedence
-        if self.text_column and self.text_column in record:
-            value = record[self.text_column]
-            return value if isinstance(value, str) else ""
-        
-        # Try priority columns, then any string value
-        candidates = [
-            *[record.get(col) for col in self.DEFAULT_PRIORITY_COLUMNS],
-            *record.values()
-        ]
-        
-        return next((v for v in candidates if isinstance(v, str) and v), "")
 
     def _corpus_to_array(self, texts: Iterable[str]) -> np.ndarray:
         """Convert an iterable of texts into a single numpy array of token IDs.

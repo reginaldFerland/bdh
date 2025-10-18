@@ -4,29 +4,39 @@ from typing import Iterable, Iterator, Optional
 
 from datasets import load_dataset
 
-from tokenizer_utils import TokenizerManager
+from tokenizer_utils import TokenizerManager, extract_text_from_record
 
-
-def extract_text(record: dict, text_column: Optional[str]) -> str:
-    if text_column:
-        value = record.get(text_column, "")
-        return value if isinstance(value, str) else ""
-
-    for key in ("text", "content", "article", "body"):
-        value = record.get(key)
-        if isinstance(value, str):
-            return value
-
-    for value in record.values():
-        if isinstance(value, str):
-            return value
-    return ""
+# Optional tqdm for progress bars
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+    tqdm = None  # type: ignore
 
 
 def iter_texts(dataset, text_column: Optional[str], limit: Optional[int] = None) -> Iterator[str]:
+    """Extract text from dataset records with optional progress tracking.
+    
+    Args:
+        dataset: HuggingFace dataset to iterate over
+        text_column: Optional specific column to extract text from
+        limit: Optional maximum number of texts to extract
+        
+    Yields:
+        Text strings from dataset records
+    """
     count = 0
-    for record in dataset:
-        text = extract_text(record, text_column)
+    
+    # Wrap with progress bar if tqdm is available
+    if HAS_TQDM:
+        desc = f"Extracting texts (limit={limit})" if limit else "Extracting texts"
+        dataset_iter = tqdm(dataset, desc=desc, unit=" docs")
+    else:
+        dataset_iter = dataset
+    
+    for record in dataset_iter:
+        text = extract_text_from_record(record, text_column)
         if not text:
             continue
         yield text
@@ -98,6 +108,12 @@ def main() -> None:
         print(f"Saved byte-level tokenizer metadata to {args.output_dir}")
         return
 
+    print(f"Loading dataset '{args.dataset_name}'...")
+    if args.dataset_config:
+        print(f"  Config: {args.dataset_config}")
+    print(f"  Split: {args.split}")
+    print(f"  Streaming: {args.streaming}")
+    
     dataset = load_dataset(
         args.dataset_name,
         args.dataset_config,
@@ -105,13 +121,22 @@ def main() -> None:
         streaming=args.streaming,
     )
 
+    print(f"\nExtracting texts from dataset...")
     texts = iter_texts(dataset, args.text_column, args.sample_limit)
+    
+    print(f"\nTraining {args.tokenizer_type} tokenizer with vocab_size={args.vocab_size}...")
+    if not HAS_TQDM:
+        print("  (Install tqdm for progress tracking: pip install tqdm)")
+    
     manager = TokenizerManager(
         tokenizer_type=args.tokenizer_type,
         vocab_size=args.vocab_size,
     )
-    manager.train_tokenizer(texts, args.output_dir, limit=args.sample_limit)
-    print(f"Tokenizer ({manager.tokenizer_type}) saved to {args.output_dir}")
+    manager.train_tokenizer(texts, args.output_dir)
+    print(f"\n✓ Tokenizer ({manager.tokenizer_type}) saved to {args.output_dir}")
+    print(f"  Final vocab size: {manager.vocab_size}")
+    print(f"  Special tokens: PAD={manager.pad_token_id}, BOS={manager.bos_token_id}, "
+          f"EOS={manager.eos_token_id}, UNK={manager.unk_token_id}")
 
 
 if __name__ == "__main__":
