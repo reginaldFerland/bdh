@@ -17,8 +17,7 @@ from tokenizer_utils import (
     TokenizerManager,
     extract_text_from_record,
     DEFAULT_TEXT_COLUMNS,
-    _CountingIterator,
-    _validate_and_prepare_training_iterator,
+    _validate_training_iterator,
 )
 
 # Check if tokenizers library is available
@@ -113,35 +112,30 @@ def test_default_text_columns_constant():
 # Iterator Utility Tests
 # ============================================================================
 
-def test_counted_iterator_preserves_data():
-    """Test that _CountingIterator doesn't lose data during iteration."""
+def test_validate_training_iterator_preserves_data():
+    """Test that _validate_training_iterator doesn't lose data during iteration."""
     data = ["hello", "world", "test", "data"]
     
-    # _CountingIterator now requires first_item to be provided
-    iterator = iter(data)
-    first = next(iterator)
-    counted = _CountingIterator(iterator, first)
+    validated_iter = _validate_training_iterator(iter(data), max_peek=10)
     
     # Iterate and verify all items are yielded
-    result = list(counted)
+    result = list(validated_iter)
     assert result == data, f"Expected {data}, got {result}"
-    assert counted.count == len(data), f"Count should be {len(data)}, got {counted.count}"
     
-    print(f"  ✓ _CountingIterator preserves all {len(data)} items")
+    print(f"  ✓ _validate_training_iterator preserves all {len(data)} items")
 
 
-def test_validate_and_prepare_training_iterator():
-    """Test the validation and preparation of training iterators."""
+def test_validate_training_iterator_with_mixed_data():
+    """Test the validation of training iterators with mixed valid and empty strings."""
     data = ["valid1", "", "valid2", "", "valid3"]
     
-    counting_iter = _validate_and_prepare_training_iterator(iter(data), max_peek=10)
+    validated_iter = _validate_training_iterator(iter(data), max_peek=10)
     
-    result = list(counting_iter)
+    result = list(validated_iter)
     # The function validates but may not filter empty strings - check actual behavior
     # Empty strings are filtered during tokenizer training, not in this utility
     expected = ["valid1", "", "valid2", "", "valid3"]
     assert result == expected, f"Expected {expected}, got {result}"
-    assert counting_iter.count == len(data), f"Count should be {len(data)}, got {counting_iter.count}"
     
     print(f"  ✓ Validation iterator preserves all items including empty strings")
 
@@ -151,30 +145,32 @@ def test_validate_and_prepare_training_iterator():
 # ============================================================================
 
 def test_tokenizer_manager_constants():
-    """Test that TokenizerManager constants are defined correctly."""
-    assert hasattr(TokenizerManager, 'MIN_VOCAB_BUFFER')
-    assert TokenizerManager.MIN_VOCAB_BUFFER == 100
-    print(f"  ✓ MIN_VOCAB_BUFFER = {TokenizerManager.MIN_VOCAB_BUFFER}")
+    """Test that TokenizerManager validation config constants are defined correctly."""
+    # Now these are in the validation config
+    assert hasattr(TokenizerManager, 'validation')
+    assert hasattr(TokenizerManager.validation, 'min_vocab_buffer')
+    assert TokenizerManager.validation.min_vocab_buffer == 100
+    print(f"  ✓ validation.min_vocab_buffer = {TokenizerManager.validation.min_vocab_buffer}")
     
-    assert hasattr(TokenizerManager, 'DEFAULT_PEEK_LIMIT')
-    assert TokenizerManager.DEFAULT_PEEK_LIMIT == 1000
-    print(f"  ✓ DEFAULT_PEEK_LIMIT = {TokenizerManager.DEFAULT_PEEK_LIMIT}")
+    assert hasattr(TokenizerManager.validation, 'default_peek_limit')
+    assert TokenizerManager.validation.default_peek_limit == 1000
+    print(f"  ✓ validation.default_peek_limit = {TokenizerManager.validation.default_peek_limit}")
     
-    assert hasattr(TokenizerManager, 'MAX_VOCAB_SIZE')
-    assert TokenizerManager.MAX_VOCAB_SIZE == 1_000_000
-    print(f"  ✓ MAX_VOCAB_SIZE = {TokenizerManager.MAX_VOCAB_SIZE:,}")
+    assert hasattr(TokenizerManager.validation, 'max_vocab_size')
+    assert TokenizerManager.validation.max_vocab_size == 1_000_000
+    print(f"  ✓ validation.max_vocab_size = {TokenizerManager.validation.max_vocab_size:,}")
     
-    assert hasattr(TokenizerManager, 'MIN_TRAINING_SAMPLES')
-    assert TokenizerManager.MIN_TRAINING_SAMPLES == 100
-    print(f"  ✓ MIN_TRAINING_SAMPLES = {TokenizerManager.MIN_TRAINING_SAMPLES}")
+    assert hasattr(TokenizerManager.validation, 'min_training_samples')
+    assert TokenizerManager.validation.min_training_samples == 100
+    print(f"  ✓ validation.min_training_samples = {TokenizerManager.validation.min_training_samples}")
     
-    assert hasattr(TokenizerManager, 'RECOMMENDED_TRAINING_SAMPLES')
-    assert TokenizerManager.RECOMMENDED_TRAINING_SAMPLES == 1_000
-    print(f"  ✓ RECOMMENDED_TRAINING_SAMPLES = {TokenizerManager.RECOMMENDED_TRAINING_SAMPLES:,}")
+    assert hasattr(TokenizerManager.validation, 'recommended_training_samples')
+    assert TokenizerManager.validation.recommended_training_samples == 1_000
+    print(f"  ✓ validation.recommended_training_samples = {TokenizerManager.validation.recommended_training_samples:,}")
     
-    assert hasattr(TokenizerManager, 'PRODUCTION_TRAINING_SAMPLES')
-    assert TokenizerManager.PRODUCTION_TRAINING_SAMPLES == 10_000
-    print(f"  ✓ PRODUCTION_TRAINING_SAMPLES = {TokenizerManager.PRODUCTION_TRAINING_SAMPLES:,}")
+    assert hasattr(TokenizerManager.validation, 'production_training_samples')
+    assert TokenizerManager.validation.production_training_samples == 10_000
+    print(f"  ✓ validation.production_training_samples = {TokenizerManager.validation.production_training_samples:,}")
 
 
 def test_min_vocab_buffer_used_in_validation():
@@ -252,8 +248,8 @@ if __name__ == "__main__":
     test_default_text_columns_constant()
     
     print("\n--- Iterator Utility Tests ---")
-    test_counted_iterator_preserves_data()
-    test_validate_and_prepare_training_iterator()
+    test_validate_training_iterator_preserves_data()
+    test_validate_training_iterator_with_mixed_data()
     
     print("\n--- Configuration Tests ---")
     test_tokenizer_manager_constants()

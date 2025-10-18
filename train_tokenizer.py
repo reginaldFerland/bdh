@@ -4,45 +4,7 @@ from typing import Iterable, Iterator, Optional
 
 from datasets import load_dataset
 
-from tokenizer_utils import TokenizerManager, extract_text_from_record
-
-# Optional tqdm for progress bars
-try:
-    from tqdm import tqdm
-    HAS_TQDM = True
-except ImportError:
-    HAS_TQDM = False
-    tqdm = None  # type: ignore
-
-
-def iter_texts(dataset, text_column: Optional[str], limit: Optional[int] = None) -> Iterator[str]:
-    """Extract text from dataset records with optional progress tracking.
-    
-    Args:
-        dataset: HuggingFace dataset to iterate over
-        text_column: Optional specific column to extract text from
-        limit: Optional maximum number of texts to extract
-        
-    Yields:
-        Text strings from dataset records
-    """
-    count = 0
-    
-    # Wrap with progress bar if tqdm is available
-    if HAS_TQDM:
-        desc = f"Extracting texts (limit={limit})" if limit else "Extracting texts"
-        dataset_iter = tqdm(dataset, desc=desc, unit=" docs")
-    else:
-        dataset_iter = dataset
-    
-    for record in dataset_iter:
-        text = extract_text_from_record(record, text_column)
-        if not text:
-            continue
-        yield text
-        count += 1
-        if limit is not None and count >= limit:
-            break
+from tokenizer_utils import TokenizerManager, iter_texts_from_dataset
 
 
 def parse_args() -> argparse.Namespace:
@@ -96,11 +58,36 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional limit on the number of text samples to use.",
     )
+    parser.add_argument(
+        "--skip-if-exists",
+        "--skip_if_exists",
+        action="store_true",
+        help="Skip training if tokenizer already exists in output directory.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    # Check if tokenizer already exists and skip if requested
+    if args.skip_if_exists:
+        config_path = Path(args.output_dir) / "tokenizer_config.json"
+        if config_path.exists():
+            print(f"✓ Tokenizer already exists at {args.output_dir}")
+            print("  Skipping training (use --no-skip-if-exists to force retrain)")
+            
+            # Load and display existing tokenizer info
+            try:
+                manager = TokenizerManager.from_directory(args.output_dir)
+                print(f"  Type: {manager.tokenizer_type}")
+                print(f"  Vocab size: {manager.vocab_size}")
+                print(f"  Special tokens: PAD={manager.pad_token_id}, BOS={manager.bos_token_id}, "
+                      f"EOS={manager.eos_token_id}, UNK={manager.unk_token_id}")
+            except Exception as e:
+                print(f"  Warning: Could not load tokenizer info: {e}")
+            
+            return
 
     if args.tokenizer_type.lower() == "byte":
         manager = TokenizerManager(tokenizer_type="byte")
@@ -122,11 +109,9 @@ def main() -> None:
     )
 
     print(f"\nExtracting texts from dataset...")
-    texts = iter_texts(dataset, args.text_column, args.sample_limit)
+    texts = iter_texts_from_dataset(dataset, args.text_column, args.sample_limit)
     
     print(f"\nTraining {args.tokenizer_type} tokenizer with vocab_size={args.vocab_size}...")
-    if not HAS_TQDM:
-        print("  (Install tqdm for progress tracking: pip install tqdm)")
     
     manager = TokenizerManager(
         tokenizer_type=args.tokenizer_type,

@@ -5,28 +5,40 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from itertools import chain
+from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Literal, Optional, Tuple, Union
 import warnings
 
 if TYPE_CHECKING:
-    from tokenizers import Tokenizer as TokenizerType
+    from tokenizers import Tokenizer as HFTokenizer
 else:
-    TokenizerType = Any  # type: ignore
+    HFTokenizer = Any
 
 try:
     from tokenizers import Tokenizer, models, normalizers, pre_tokenizers, trainers
 except ImportError:
-    Tokenizer = None  # type: ignore
-    models = None  # type: ignore
-    normalizers = None  # type: ignore
-    pre_tokenizers = None  # type: ignore
-    trainers = None  # type: ignore
+    Tokenizer = None
+    models = None
+    normalizers = None
+    pre_tokenizers = None
+    trainers = None
 
 
-# Module-level constants
 DEFAULT_TEXT_COLUMNS = ("text", "content", "article", "body")
+TokenizerType = Literal["byte", "bpe", "wordpiece", "unigram"]
+
+
+def _is_valid_text(value: Any) -> bool:
+    """Check if a value is a non-empty string.
+    
+    Args:
+        value: Value to check
+        
+    Returns:
+        True if value is a non-empty string, False otherwise
+    """
+    return isinstance(value, str) and bool(value)
 
 
 def extract_text_from_record(
@@ -63,97 +75,118 @@ def extract_text_from_record(
         >>> extract_text_from_record(record, text_column="custom_field")
         'Text'
     """
-    # Explicit column takes precedence
     if text_column and text_column in record:
         value = record[text_column]
-        return value if isinstance(value, str) else ""
+        return value if _is_valid_text(value) else ""
     
-    # Try priority columns first with early return
     for col in priority_columns:
-        if col in record:
-            value = record[col]
-            if isinstance(value, str) and value:
-                return value
+        if col in record and _is_valid_text(record[col]):
+            return record[col]
     
-    # Fall back to any string value in the record
     for value in record.values():
-        if isinstance(value, str) and value:
+        if _is_valid_text(value):
             return value
     
     return ""
 
 
-class _CountingIterator:
-    """Lightweight iterator wrapper that counts items.
+def iter_texts_from_dataset(
+    dataset: Iterable,
+    text_column: Optional[str] = None,
+    limit: Optional[int] = None,
+    show_progress: bool = True,
+) -> Iterator[str]:
+    """Extract text from dataset records with optional progress tracking.
     
-    After initial validation confirms the iterator contains valid data,
-    this wrapper simply counts items without re-validating each one.
-    This improves performance by avoiding wasteful type checks.
-    """
+    This utility function extracts text from HuggingFace dataset records,
+    filtering out empty records and optionally limiting the number of texts.
     
-    def __init__(self, iterator: Iterator[str], first_item: str):
-        self._iterator = iterator
-        self._first_item = first_item
-        self._yielded_first = False
-        self.count = 0
-    
-    def __iter__(self):
-        return self
-    
-    def __next__(self) -> str:
-        # Yield the first valid item we already found
-        if not self._yielded_first:
-            self._yielded_first = True
-            self.count += 1
-            return self._first_item
+    Args:
+        dataset: HuggingFace dataset (or any iterable of dict-like records) to iterate over
+        text_column: Optional specific column to extract text from
+        limit: Optional maximum number of texts to extract
+        show_progress: Whether to show a progress bar (requires tqdm)
         
-        # Yield remaining items without re-validation (trust the data source)
-        # Validation already passed during peek phase in _validate_and_prepare_training_iterator
-        item = next(self._iterator)  # Will raise StopIteration when done
-        self.count += 1
-        return item
-
-
-def _validate_and_prepare_training_iterator(
-    texts: Iterable[str],
-    max_peek: int = 100,
-) -> _CountingIterator:
-    """Validate training data and prepare iterator with sample counting.
+    Yields:
+        Text strings from dataset records
+        
+    Examples:
+        >>> from datasets import load_dataset
+        >>> dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+        >>> texts = iter_texts_from_dataset(dataset, text_column="text", limit=1000)
+        >>> for text in texts:
+        ...     process(text)
+    """
+    count = 0
     
-    This function checks that the iterator contains at least one valid text sample
-    and returns a new iterator that validates and counts samples as they're consumed.
+    if show_progress:
+        try:
+            from tqdm import tqdm
+            desc = f"Extracting texts (limit={limit})" if limit else "Extracting texts"
+            dataset_iter = tqdm(dataset, desc=desc, unit=" docs")
+        except ImportError:
+            dataset_iter = dataset
+    else:
+        dataset_iter = dataset
+    
+    for record in dataset_iter:
+        text = extract_text_from_record(record, text_column)
+        if not text:
+            continue
+        yield text
+        count += 1
+        if limit is not None and count >= limit:
+            break
+
+
+def _validate_training_iterator(
+    texts: Iterable[str],
+    validate: bool = True,
+    max_peek: int = 100,
+) -> Iterator[str]:
+    """Optionally validate training data has at least one valid sample.
+    
+    When validation is enabled, checks that the first valid item is valid text.
+    This approach doesn't duplicate data in memory and uses a single efficient loop.
     
     Args:
         texts: Iterable of text strings for training
+        validate: Whether to perform validation (default: True)
         max_peek: Maximum number of items to check for first valid sample
         
-    Returns:
-        A counting iterator that validates items and tracks count
+    Yields:
+        Text strings from the input iterator
         
     Raises:
-        ValueError: If no valid text samples found within max_peek items
+        ValueError: If validation enabled and no valid text samples found
     """
-    iterator = iter(texts)
+    if not validate:
+        yield from texts
+        return
     
-    # Try to find the first valid item
-    first_valid = None
+    found_valid = False
     items_checked = 0
     
-    for item in iterator:
+    for item in texts:
         items_checked += 1
-        if isinstance(item, str) and item:
-            first_valid = item
-            break
-        if items_checked >= max_peek:
-            break
+        
+        if items_checked <= max_peek:
+            if not found_valid and isinstance(item, str) and item:
+                found_valid = True
+        
+        yield item
+        
+        if items_checked == max_peek and not found_valid:
+            raise ValueError(
+                f"No valid text samples found in first {max_peek} items. "
+                "Ensure the input contains non-empty strings."
+            )
     
-    if first_valid is None:
+    if not found_valid:
         raise ValueError(
-            f"No valid text samples found in first {items_checked} items. "
+            f"No valid text samples found in {items_checked} items. "
             "Ensure the input contains non-empty strings."
         )
-    
-    return _CountingIterator(iterator, first_valid)
 
 
 @dataclass
@@ -166,6 +199,19 @@ class TokenizerMetadata:
     unk_token_id: Optional[int] = None
 
 
+@dataclass
+class TokenizerValidationConfig:
+    """Configuration for tokenizer validation thresholds and limits."""
+    
+    max_vocab_size: int = 1_000_000
+    min_training_samples: int = 100
+    recommended_training_samples: int = 1_000
+    production_training_samples: int = 10_000
+    min_vocab_buffer: int = 100
+    min_vocab_ratio: float = 0.8
+    default_peek_limit: int = 1000
+
+
 class TokenizerManager:
     """Lightweight wrapper around HuggingFace tokenizers with byte fallback."""
 
@@ -175,15 +221,8 @@ class TokenizerManager:
     UNK_TOKEN = "<UNK>"
     SPECIAL_TOKENS = [PAD_TOKEN, BOS_TOKEN, EOS_TOKEN, UNK_TOKEN]
     
-    # Validation and size constants
-    MAX_VOCAB_SIZE = 1_000_000
-    MIN_TRAINING_SAMPLES = 100
-    RECOMMENDED_TRAINING_SAMPLES = 1_000
-    PRODUCTION_TRAINING_SAMPLES = 10_000
-    MIN_VOCAB_BUFFER = 100  # Minimum tokens beyond special tokens
-    DEFAULT_PEEK_LIMIT = 1000  # Default items to check in iterator validation
+    validation = TokenizerValidationConfig()
     
-    # Error message constants
     _TOKENIZERS_IMPORT_ERROR = (
         "The `tokenizers` library is required for non-byte tokenizers. "
         "Install it with `pip install tokenizers>=0.15.0`."
@@ -198,10 +237,10 @@ class TokenizerManager:
         "Call train_tokenizer() first."
     )
 
-    def __init__(self, tokenizer_type: str = "byte", vocab_size: int = 256, _skip_validation: bool = False):
+    def __init__(self, tokenizer_type: TokenizerType = "byte", vocab_size: int = 256):
         self.tokenizer_type = tokenizer_type.lower()
         self.requested_vocab_size = vocab_size
-        self.tokenizer: Optional[TokenizerType] = None
+        self.tokenizer: Optional[HFTokenizer] = None
         self.vocab_size = 256 if self.tokenizer_type == "byte" else vocab_size
         self.pad_token_id: Optional[int] = None
         self.bos_token_id: Optional[int] = None
@@ -211,19 +250,19 @@ class TokenizerManager:
         
         if vocab_size <= 0:
             raise ValueError(f"vocab_size must be positive, got {vocab_size}")
-        if vocab_size > self.MAX_VOCAB_SIZE:
+        if vocab_size > self.validation.max_vocab_size:
             raise ValueError(
-                f"vocab_size {vocab_size} is unusually large (>{self.MAX_VOCAB_SIZE:,} tokens). "
+                f"vocab_size {vocab_size} is unusually large (>{self.validation.max_vocab_size:,} tokens). "
                 "This may cause memory issues. If intentional, adjust this limit."
             )
         
-        if not _skip_validation and self.tokenizer_type != "byte":
-            min_vocab_size = len(self.SPECIAL_TOKENS) + self.MIN_VOCAB_BUFFER
+        if self.tokenizer_type != "byte":
+            min_vocab_size = len(self.SPECIAL_TOKENS) + self.validation.min_vocab_buffer
             if vocab_size < min_vocab_size:
                 raise ValueError(
                     f"vocab_size {vocab_size} is too small for '{self.tokenizer_type}' tokenizer. "
                     f"Minimum is {min_vocab_size} ({len(self.SPECIAL_TOKENS)} special tokens + "
-                    f"{self.MIN_VOCAB_BUFFER} regular tokens). Consider using 'byte' tokenizer for small vocabularies."
+                    f"{self.validation.min_vocab_buffer} regular tokens). Consider using 'byte' tokenizer for small vocabularies."
                 )
 
         if self.tokenizer_type != "byte" and Tokenizer is None:
@@ -261,16 +300,7 @@ class TokenizerManager:
         if self.tokenizer_type == "byte":
             filtered = token_ids
             if skip_special_tokens:
-                special_ids = {
-                    sid
-                    for sid in (
-                        self.pad_token_id,
-                        self.bos_token_id,
-                        self.eos_token_id,
-                        self.unk_token_id,
-                    )
-                    if sid is not None
-                }
+                special_ids = self._special_token_ids
                 if special_ids:
                     filtered = [tid for tid in filtered if tid not in special_ids]
             return bytes(filtered).decode("utf-8", errors="backslashreplace")
@@ -289,7 +319,25 @@ class TokenizerManager:
             return []
 
         if self.tokenizer_type == "byte":
-            return [self.encode(text, add_special_tokens) for text in texts]
+            if not add_special_tokens:
+                return [list(text.encode("utf-8")) for text in texts]
+            
+            add_bos = self.bos_token_id is not None
+            add_eos = self.eos_token_id is not None
+            bos_id = self.bos_token_id
+            eos_id = self.eos_token_id
+            
+            result = []
+            for text in texts:
+                encoded = list(text.encode("utf-8"))
+                if add_bos and add_eos:
+                    encoded = [bos_id] + encoded + [eos_id]
+                elif add_bos:
+                    encoded = [bos_id] + encoded
+                elif add_eos:
+                    encoded = encoded + [eos_id]
+                result.append(encoded)
+            return result
 
         if self.tokenizer is None:
             raise RuntimeError(
@@ -306,7 +354,18 @@ class TokenizerManager:
             return []
 
         if self.tokenizer_type == "byte":
-            return [self.decode(token_ids, skip_special_tokens) for token_ids in token_id_lists]
+            if not skip_special_tokens:
+                return [bytes(token_ids).decode("utf-8", errors="backslashreplace") 
+                        for token_ids in token_id_lists]
+            
+            special_ids = self._special_token_ids
+            if not special_ids:
+                return [bytes(token_ids).decode("utf-8", errors="backslashreplace") 
+                        for token_ids in token_id_lists]
+            
+            return [bytes([tid for tid in token_ids if tid not in special_ids])
+                    .decode("utf-8", errors="backslashreplace") 
+                    for token_ids in token_id_lists]
 
         if self.tokenizer is None:
             raise RuntimeError(
@@ -326,35 +385,31 @@ class TokenizerManager:
         if Tokenizer is None:
             raise ImportError(self._TOKENIZERS_IMPORT_ERROR)
         
-        # Validate and prepare training iterator
-        counting_iter = _validate_and_prepare_training_iterator(texts, max_peek=100)
+        validated_iter = _validate_training_iterator(
+            texts, 
+            validate=True,
+            max_peek=self.validation.default_peek_limit
+        )
         
         tokenizer, trainer = self._build_tokenizer_and_trainer()
         
-        tokenizer.train_from_iterator(counting_iter, trainer=trainer)
-        
-        # Get final count and warn if too small
-        final_count = counting_iter.count
-        if final_count < self.MIN_TRAINING_SAMPLES:
-            warnings.warn(
-                f"Only {final_count} samples provided for training. "
-                f"Tokenizer quality may be poor. Recommend at least {self.RECOMMENDED_TRAINING_SAMPLES:,} samples "
-                f"for reasonable quality, {self.PRODUCTION_TRAINING_SAMPLES:,}+ for production use.",
-                UserWarning
-            )
+        tokenizer.train_from_iterator(validated_iter, trainer=trainer)
         
         self.tokenizer = tokenizer
         self.vocab_size = tokenizer.get_vocab_size()
         self._populate_special_token_ids()
         self._configure_bpe_post_processor()
         
-        # Validate that actual vocab size is reasonable compared to requested
-        if self.vocab_size < self.requested_vocab_size * 0.8:
+        if self.vocab_size < self.requested_vocab_size * self.validation.min_vocab_ratio:
+            vocab_deficit = self.requested_vocab_size - self.vocab_size
             warnings.warn(
-                f"Trained vocab size ({self.vocab_size}) is significantly smaller than "
-                f"requested ({self.requested_vocab_size}). This typically indicates insufficient "
-                f"or insufficiently diverse training data. Consider providing more text samples.",
-                UserWarning
+                f"Trained vocab size ({self.vocab_size:,}) is significantly smaller than "
+                f"requested ({self.requested_vocab_size:,}), missing {vocab_deficit:,} tokens "
+                f"({(1 - self.vocab_size/self.requested_vocab_size)*100:.1f}% deficit). "
+                f"This typically indicates insufficient or insufficiently diverse training data. "
+                f"Consider providing more text samples.",
+                UserWarning,
+                stacklevel=2
             )
 
         save_path = self.save(output_dir)
@@ -426,7 +481,6 @@ class TokenizerManager:
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         
-        # Write config atomically using temp file + rename
         config_path = directory / "tokenizer_config.json"
         temp_config = directory / "tokenizer_config.json.tmp"
         
@@ -434,13 +488,11 @@ class TokenizerManager:
         try:
             with temp_config.open("w", encoding="utf-8") as f:
                 json.dump(metadata.__dict__, f, indent=2, sort_keys=True)
-                f.flush()  # Flush Python buffer
-                os.fsync(f.fileno())  # Ensure OS writes to disk
+                f.flush()
+                os.fsync(f.fileno())
             
-            # Atomic rename (POSIX guarantees atomicity)
             temp_config.replace(config_path)
         except Exception:
-            # Clean up temp file on error
             temp_config.unlink(missing_ok=True)
             raise
 
@@ -449,23 +501,53 @@ class TokenizerManager:
                 raise RuntimeError(
                     self._TOKENIZER_NOT_TRAINED_ERROR.format(tokenizer_type=self.tokenizer_type)
                 )
-            # Atomic save for tokenizer.json using temp file + rename
             tokenizer_path = directory / "tokenizer.json"
             temp_tokenizer = directory / "tokenizer.json.tmp"
             try:
                 self.tokenizer.save(str(temp_tokenizer))
-                # Ensure tokenizer file is synced to disk
                 with open(temp_tokenizer, 'rb') as f:
                     os.fsync(f.fileno())
-                # Atomic rename (POSIX guarantees atomicity)
                 temp_tokenizer.replace(tokenizer_path)
             except Exception:
-                # Clean up temp file on error
                 temp_tokenizer.unlink(missing_ok=True)
                 raise
         
+        try:
+            dir_fd = os.open(str(directory), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except (OSError, AttributeError):
+            pass
+        
         self.tokenizer_path = str(directory)
         return directory
+
+    @classmethod
+    def _from_metadata(cls, metadata: TokenizerMetadata, directory: Path) -> "TokenizerManager":
+        """Internal constructor for loading tokenizer from metadata.
+        
+        This bypasses the normal validation since we're loading a pre-trained tokenizer.
+        
+        Args:
+            metadata: Tokenizer metadata loaded from disk
+            directory: Directory containing the tokenizer files
+            
+        Returns:
+            TokenizerManager instance with metadata populated
+        """
+        manager = object.__new__(cls)
+        manager.tokenizer_type = metadata.tokenizer_type.lower()
+        manager.requested_vocab_size = metadata.vocab_size
+        manager.vocab_size = metadata.vocab_size
+        manager.tokenizer = None
+        manager.pad_token_id = metadata.pad_token_id
+        manager.bos_token_id = metadata.bos_token_id
+        manager.eos_token_id = metadata.eos_token_id
+        manager.unk_token_id = metadata.unk_token_id
+        manager.tokenizer_path = str(directory)
+        return manager
 
     @classmethod
     def from_directory(cls, directory: Union[str, Path]) -> "TokenizerManager":
@@ -477,16 +559,7 @@ class TokenizerManager:
             metadata_dict = json.load(f)
 
         metadata = TokenizerMetadata(**metadata_dict)
-        manager = cls(
-            tokenizer_type=metadata.tokenizer_type,
-            vocab_size=metadata.vocab_size,
-            _skip_validation=True,
-        )
-        manager.pad_token_id = metadata.pad_token_id
-        manager.bos_token_id = metadata.bos_token_id
-        manager.eos_token_id = metadata.eos_token_id
-        manager.unk_token_id = metadata.unk_token_id
-        manager.tokenizer_path = str(directory)
+        manager = cls._from_metadata(metadata, directory)
 
         if manager.tokenizer_type != "byte":
             if Tokenizer is None:
@@ -498,7 +571,6 @@ class TokenizerManager:
             manager._populate_special_token_ids()
             manager.vocab_size = manager.tokenizer.get_vocab_size()
             
-            # Validate that loaded special tokens match metadata using helper method
             loaded_tokens = manager._get_special_token_map()
             metadata_tokens = {
                 "PAD": metadata.pad_token_id,
@@ -548,6 +620,29 @@ class TokenizerManager:
             unk_token_id=self.unk_token_id,
         )
 
+    def _reset_cached_properties(self) -> None:
+        """Clear cached properties after special tokens change."""
+        if hasattr(self, '_special_token_ids'):
+            delattr(self, '_special_token_ids')
+
+    @cached_property
+    def _special_token_ids(self) -> set:
+        """Lazily compute and cache the set of special token IDs.
+        
+        Returns:
+            Set of special token IDs (excluding None values)
+        """
+        return {
+            sid
+            for sid in (
+                self.pad_token_id,
+                self.bos_token_id,
+                self.eos_token_id,
+                self.unk_token_id,
+            )
+            if sid is not None
+        }
+
     def _get_special_token_map(self) -> Dict[str, Optional[int]]:
         """Return mapping of special token names to their IDs.
         
@@ -567,17 +662,18 @@ class TokenizerManager:
             self.bos_token_id = None
             self.eos_token_id = None
             self.unk_token_id = None
+            self._reset_cached_properties()
             return
 
         assert self.tokenizer is not None
         
-        # Populate all special token IDs from the tokenizer
         self.pad_token_id = self.tokenizer.token_to_id(self.PAD_TOKEN)
         self.bos_token_id = self.tokenizer.token_to_id(self.BOS_TOKEN)
         self.eos_token_id = self.tokenizer.token_to_id(self.EOS_TOKEN)
         self.unk_token_id = self.tokenizer.token_to_id(self.UNK_TOKEN)
         
-        # Check for missing tokens using the helper method
+        self._reset_cached_properties()
+        
         special_map = self._get_special_token_map()
         missing_tokens = [name for name, token_id in special_map.items() if token_id is None]
         
