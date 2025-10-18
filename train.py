@@ -260,6 +260,8 @@ def _build_checkpoint_state(
 def setup_precision(device: torch.device):
     if device.type == "cuda":
         dtype = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+    elif device.type == "mps":
+        dtype = "bfloat16"
     else:
         dtype = "float32"
     torch_dtype = {
@@ -269,7 +271,7 @@ def setup_precision(device: torch.device):
     }[dtype]
     ctx = (
         torch.amp.autocast(device_type=device.type, dtype=torch_dtype)
-        if device.type == "cuda"
+        if device.type == "cuda" or device.type == "mps"
         else nullcontext()
     )
     scaler = torch.amp.GradScaler(device=device.type, enabled=(dtype == "float16"))
