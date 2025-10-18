@@ -12,14 +12,14 @@ from torch import nn
 
 @dataclasses.dataclass
 class BDHConfig:
-    n_layer: int = 6
-    n_embd: int = 256
+    n_layer: int = 12
+    n_embd: int = 512
     dropout: float = 0.1
-    n_head: int = 4
+    n_head: int = 6
     mlp_internal_dim_multiplier: int = 128
-    vocab_size: int = 256
-    tokenizer_type: str = "byte"
-    tokenizer_vocab_size: int = 256
+    vocab_size: int = 16000
+    tokenizer_type: str = "bpe"
+    tokenizer_vocab_size: int = 16000
     tokenizer_path: Optional[str] = None
     bos_token_id: Optional[int] = None
     eos_token_id: Optional[int] = None
