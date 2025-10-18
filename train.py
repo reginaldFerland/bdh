@@ -312,7 +312,7 @@ def main() -> None:
     # Setup logging
     logger = setup_logging(log_dir=Path(args.log_dir))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu')
     torch.manual_seed(1337)
 
     if device.type == "cuda":
